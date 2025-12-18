@@ -21,6 +21,8 @@ typedef void        (*lua_pushnil_t)(lua_State *L);
 typedef const char* (*lua_tolstring_t)(lua_State *L, int idx, size_t *len);
 typedef int         (*lua_type_t)(lua_State *L, int idx);
 typedef const char* (*lua_typename_t)(lua_State *L, int tp);
+typedef double      (*lua_tonumber_t)(lua_State *L, int idx);
+typedef int         (*lua_toboolean_t)(lua_State *L, int idx);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
 typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
@@ -69,6 +71,8 @@ private:
     lua_tolstring_t p_tolstring = nullptr;
     lua_type_t      p_type = nullptr;
     lua_typename_t  p_typename = nullptr;
+    lua_tonumber_t  p_tonumber = nullptr;
+    lua_toboolean_t p_toboolean = nullptr;
     lua_pcallk_t    p_pcallk = nullptr;
 
     // Loaders
@@ -86,6 +90,7 @@ private:
     std::atomic<bool> m_RecursionGuard = false;
     uint32_t m_LastTick = 0;
 
+    friend int MyLuaGetTop(lua_State *L);
     friend int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name, const char *mode);
     friend int MyLuaLoadString(lua_State* L, const char* s);
     friend int MyLuaPcall(lua_State *L, int nargs, int nresults, int errfunc);
@@ -110,6 +115,16 @@ void HookProcessHelper(LuaInterface& lua, lua_State* L) {
         lua.m_LastTick = now;
     }
     lua.m_RecursionGuard = false;
+}
+
+int MyLuaGetTop(lua_State *L) {
+    auto& lua = LuaInterface::Get();
+    HookProcessHelper(lua, L);
+
+    lua.DisableHook();
+    int ret = lua.p_gettop(L);
+    lua.EnableHook();
+    return ret;
 }
 
 int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name, const char *mode) {
@@ -165,6 +180,7 @@ int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, vo
 void LuaInterface::Initialize() {
     std::cout << "[Agent] Scanning for Lua..." << std::endl;
 
+    // 1. Try Common Names
     const char* names[] = { "lua54.dll", "lua5.4.dll", "lua53.dll", "lua.dll", "xlua.dll" };
     for (const char* name : names) {
         m_hLua = GetModuleHandleA(name);
@@ -174,8 +190,31 @@ void LuaInterface::Initialize() {
         }
     }
 
+    // 2. Try Scanning All Modules
     if (!m_hLua) {
-        m_hLua = GetModuleHandle(NULL); // Try Main Executable
+        std::cout << "[Agent] Scanning all modules..." << std::endl;
+        HMODULE hMods[1024];
+        DWORD cbNeeded;
+        HANDLE hProcess = GetCurrentProcess();
+        if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+            unsigned int numMods = cbNeeded / sizeof(HMODULE);
+            if (numMods > 1024) numMods = 1024;
+            for (unsigned int i = 0; i < numMods; i++) {
+                if (GetProcAddress(hMods[i], "lua_gettop")) {
+                     char modName[MAX_PATH];
+                     if (GetModuleBaseNameA(hProcess, hMods[i], modName, sizeof(modName))) {
+                         std::cout << "[Agent] Found Lua symbols in: " << modName << std::endl;
+                         m_hLua = hMods[i];
+                         break;
+                     }
+                }
+            }
+        }
+    }
+
+    // 3. Try Main Executable (Fallback)
+    if (!m_hLua) {
+        m_hLua = GetModuleHandle(NULL);
         if (GetProcAddress(m_hLua, "lua_gettop")) {
             std::cout << "[Agent] Found Lua symbols in Main Executable." << std::endl;
         } else {
@@ -200,6 +239,8 @@ void LuaInterface::ResolveSymbols(HMODULE hMod) {
     p_tolstring = (lua_tolstring_t)GetProcAddress(hMod, "lua_tolstring");
     p_type = (lua_type_t)GetProcAddress(hMod, "lua_type");
     p_typename = (lua_typename_t)GetProcAddress(hMod, "lua_typename");
+    p_tonumber = (lua_tonumber_t)GetProcAddress(hMod, "lua_tonumber");
+    p_toboolean = (lua_toboolean_t)GetProcAddress(hMod, "lua_toboolean");
 
     // Pcall variants
     p_pcallk = (lua_pcallk_t)GetProcAddress(hMod, "lua_pcallk");
@@ -302,25 +343,66 @@ std::string LuaInterface::DumpGlobals() {
     if (!p_getglobal) return "lua_getglobal not found (Macro?). Use a script to iterate _G instead.";
 
     std::string out;
-    out.reserve(65536);
-    out = "Globals Dump:\n";
+    out.reserve(1024 * 1024); // Reserve 1MB to minimize reallocations
+    out = "Globals Dump (Limited to 2000 items):\n";
+
+    // Ensure we have stack space
+    // lua_checkstack is often a macro or function, we don't have it resolved.
+    // But standard lua stack is usually enough for this simple iteration.
 
     p_getglobal(m_L, "_G");
     if (p_gettop(m_L) > 0) {
         p_pushnil(m_L);
+        int count = 0;
+        // Iterate _G
         while (p_next(m_L, -2) != 0) {
+            if (count++ > 2000) { // Limit items to prevent timeout/freeze
+                out.append("... [Output Truncated] ...\n");
+                // Pop value AND key to clean stack before breaking
+                // Stack is: _G, key, val. We need it to be: _G.
+                // p_settop(L, -3) pops 2 elements (val, key).
+                p_settop(m_L, -3);
+                break;
+            }
+
             // Stack: _G, key, val
             // Get Key String
             p_pushvalue(m_L, -2);
             const char* key = p_tolstring(m_L, -1, NULL);
-            std::string keyStr = key ? key : "(non-string key)";
+            if (key) {
+                out.append(key);
+            } else {
+                out.append("(non-string key)");
+            }
             p_settop(m_L, -2); // pop key copy
 
             // Get Value Type
             int type = p_type ? p_type(m_L, -1) : 0;
             const char* typeName = p_typename ? p_typename(m_L, type) : "unknown";
 
-            out += keyStr + " [" + typeName + "]\n";
+            out.append(" [");
+            out.append(typeName);
+            out.append("]");
+
+            // Value Preview
+            if (type == 3 && p_tonumber) { // LUA_TNUMBER
+                 double val = p_tonumber(m_L, -1);
+                 out.append(" = ");
+                 out.append(std::to_string(val));
+            } else if (type == 1 && p_toboolean) { // LUA_TBOOLEAN
+                 int val = p_toboolean(m_L, -1);
+                 out.append(" = ");
+                 out.append(val ? "true" : "false");
+            } else if (type == 4 && p_tolstring) { // LUA_TSTRING
+                 out.append(" = \"");
+                 const char* s = p_tolstring(m_L, -1, NULL);
+                 std::string valStr = s ? s : "";
+                 if (valStr.length() > 64) valStr = valStr.substr(0, 61) + "..."; // Truncate long strings
+                 out.append(valStr);
+                 out.append("\"");
+            }
+
+            out.append("\n");
 
             p_settop(m_L, -2); // pop value
         }
@@ -349,23 +431,47 @@ bool LuaInterface::ProcessTasks() {
         Task t = g_TaskQueue.front();
         g_TaskQueue.pop();
 
-        if (t.type == CMD_RUN_SCRIPT) {
-            std::string err;
-            if (LoadScript(t.payload, err)) {
-                // Success
-                MessageHeader h = { 0, RESP_OK };
-                DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-            } else {
-                // Error
+        if (t.type == CMD_PING) {
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_RUN_SCRIPT) {
+            if (!m_L) {
+                std::string err = "Lua state not ready (hooks not installed).";
                 MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
                 DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
                 WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
+            } else {
+                std::string err;
+                try {
+                    if (LoadScript(t.payload, err)) {
+                        // Success
+                        MessageHeader h = { 0, RESP_OK };
+                        DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+                    } else {
+                        // Error
+                        MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
+                        DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+                        WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
+                    }
+                } catch (...) {
+                    std::string except = "Exception caught during LoadScript";
+                    MessageHeader h = { (uint32_t)except.size(), RESP_ERROR };
+                    DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+                    WriteFile(t.pipe, except.data(), except.size(), &w, NULL);
+                }
             }
         } else if (t.type == CMD_DUMP_GLOBALS) {
-            std::string data = DumpGlobals();
-            MessageHeader h = { (uint32_t)data.size(), RESP_DATA };
-            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-            WriteFile(t.pipe, data.data(), data.size(), &w, NULL);
+            if (!m_L) {
+                std::string err = "Lua state not ready (hooks not installed).";
+                MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
+                DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+                WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
+            } else {
+                std::string data = DumpGlobals();
+                MessageHeader h = { (uint32_t)data.size(), RESP_DATA };
+                DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+                WriteFile(t.pipe, data.data(), data.size(), &w, NULL);
+            }
         }
         CloseHandle(t.pipe);
     }
@@ -397,9 +503,15 @@ void PipeServerThread() {
                     }
 
                     std::cout << "[Agent] Task Queued. Type: " << (int)h.type << std::endl;
-                    std::lock_guard<std::mutex> lock(g_TaskMutex);
-                    g_TaskQueue.push({ h.type, payload, hPipe });
-                    // Do not close pipe here, task will close it
+                    {
+                        std::lock_guard<std::mutex> lock(g_TaskMutex);
+                        g_TaskQueue.push({ h.type, payload, hPipe });
+                    }
+                    // If Lua is not loaded (hooks not active), we must process the task immediately
+                    // to avoid timeout (since HookProcessHelper won't be called).
+                    if (!LuaInterface::Get().IsLoaded()) {
+                         LuaInterface::Get().ProcessTasks();
+                    }
                 } else {
                     std::cout << "[Agent] Failed to read request. Error: " << GetLastError() << std::endl;
                     CloseHandle(hPipe);

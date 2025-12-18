@@ -1,7 +1,48 @@
 #include <windows.h>
+#include <tlhelp32.h>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+
+// Helper to check if a module is already loaded in the target process
+bool IsModuleLoaded(DWORD pid, const std::string& moduleName) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+    bool found = false;
+
+    if (Module32First(hSnap, &me32)) {
+        do {
+            std::string currentModule;
+            #ifdef UNICODE
+            char modName[MAX_PATH];
+            size_t c;
+            wcstombs_s(&c, modName, MAX_PATH, me32.szModule, MAX_PATH);
+            currentModule = modName;
+            #else
+            currentModule = me32.szModule;
+            #endif
+
+            // Case insensitive comparison
+            std::string nameLower = moduleName;
+            std::string currentLower = currentModule;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+            std::transform(currentLower.begin(), currentLower.end(), currentLower.begin(), ::tolower);
+
+            // Check if the module name ends with our target name (handles full paths vs filenames)
+            if (currentLower.find(nameLower) != std::string::npos) {
+                found = true;
+                break;
+            }
+        } while (Module32Next(hSnap, &me32));
+    }
+    CloseHandle(hSnap);
+    return found;
+}
 
 // Helper to check file existence
 bool FileExists(const std::string& name) {
@@ -30,6 +71,13 @@ bool InjectLibrary(DWORD pid, const std::string& library_path) {
     if (!FileExists(library_path)) {
         std::cerr << "Library not found: " << library_path << std::endl;
         return false;
+    }
+
+    // Check if already injected
+    std::string libName = library_path.substr(library_path.find_last_of("\\/") + 1);
+    if (IsModuleLoaded(pid, libName)) {
+        std::cerr << "Library already loaded in process." << std::endl;
+        return true; // Already success
     }
 
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
