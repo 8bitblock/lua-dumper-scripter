@@ -1,3 +1,4 @@
+#define SDL_MAIN_HANDLED
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_opengl3.h>
@@ -15,7 +16,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
-#include "ipc.h"
+#include "../common/lua_ipc.h"
 
 // Forward declare Injector
 bool InjectLibrary(DWORD pid, const std::string& library_path);
@@ -85,6 +86,12 @@ public:
         return logs;
     }
 
+    bool IsBusy() const { return m_IsBusy; }
+    std::string GetStatusText() {
+        std::lock_guard<std::mutex> lock(m_StatusMutex);
+        return m_StatusText;
+    }
+
 private:
     RemoteAgent() = default;
 
@@ -115,17 +122,27 @@ private:
     }
 
     void ProcessCommand(const Command& cmd) {
+        m_IsBusy = true;
+        {
+            std::lock_guard<std::mutex> lock(m_StatusMutex);
+            if (cmd.type == CMD_RUN_SCRIPT) m_StatusText = "Running Script...";
+            else if (cmd.type == CMD_DUMP_GLOBALS) m_StatusText = "Dumping Globals...";
+            else m_StatusText = "Processing...";
+        }
+
         char pipeName[256];
         sprintf_s(pipeName, "\\\\.\\pipe\\luatool_%lu", cmd.pid);
 
         if (!WaitNamedPipeA(pipeName, 2000)) {
             Log("[Error] Pipe not ready. Error: " + std::to_string(GetLastError()));
+            m_IsBusy = false;
             return;
         }
 
         HANDLE hPipe = CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
         if (hPipe == INVALID_HANDLE_VALUE) {
             Log("[Error] Failed to connect. Error: " + std::to_string(GetLastError()));
+            m_IsBusy = false;
             return;
         }
 
@@ -138,38 +155,24 @@ private:
         if (!WriteFile(hPipe, &header, sizeof(header), &w, NULL)) {
             Log("[Error] Write Header Failed. Error: " + std::to_string(GetLastError()));
             CloseHandle(hPipe);
+            m_IsBusy = false;
             return;
         }
         if (header.length > 0) {
             if (!WriteFile(hPipe, cmd.payload.data(), header.length, &w, NULL)) {
                 Log("[Error] Write Payload Failed. Error: " + std::to_string(GetLastError()));
                 CloseHandle(hPipe);
+                m_IsBusy = false;
                 return;
             }
         }
 
         // Stream Response
         while (true) {
-            // Wait for data with timeout
-            bool dataReady = false;
-            for (int i = 0; i < 50; i++) { // 5 seconds timeout for *next packet*
-                DWORD avail = 0;
-                if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-                    dataReady = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            if (!dataReady) {
-                Log("[Timeout] Agent timed out waiting for next packet.");
-                break;
-            }
-
             MessageHeader resp;
             DWORD r;
             if (!ReadFile(hPipe, &resp, sizeof(resp), &r, NULL) || r != sizeof(resp)) {
-                Log("[Error] Failed to read header.");
+                Log("[Error] Failed to read header (Pipe Closed or Error).");
                 break;
             }
 
@@ -193,13 +196,14 @@ private:
             } else if (resp.type == RESP_DATA) {
                 Log(body);
             } else if (resp.type == RESP_PROGRESS) {
-                // Update progress text
-                // We'll need to store this somewhere to show in GUI
-                // For now log it to console to verify
+                std::lock_guard<std::mutex> lock(m_StatusMutex);
+                m_StatusText = body;
+                // Also log progress to the console
                 Log("[Progress] " + body);
             }
         }
         CloseHandle(hPipe);
+        m_IsBusy = false;
     }
 
     std::mutex m_QueueMutex;
@@ -210,6 +214,10 @@ private:
 
     std::thread m_Worker;
     std::atomic<bool> m_Running = false;
+
+    std::atomic<bool> m_IsBusy{false};
+    std::mutex m_StatusMutex;
+    std::string m_StatusText;
 };
 
 // ----------------------------------------------------------------------------
@@ -220,7 +228,7 @@ std::string output_log;
 char script_buffer[16384] = "print('Hello')";
 char filter_buf[128] = "";
 
-int main(int, char**) {
+int main(int argc, char* argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) return -1;
 
     const char* glsl_version = "#version 130";
@@ -285,120 +293,129 @@ int main(int, char**) {
             ImGui::SetNextWindowSize(io.DisplaySize);
             ImGui::Begin("LuaTool", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
-            ImGui::Columns(2, "MainLayout", true);
-            static bool initial_layout = true;
-            if (initial_layout) {
-                ImGui::SetColumnWidth(0, 250);
-                initial_layout = false;
-            }
+            if (ImGui::BeginTabBar("MainTabs")) {
+                if (ImGui::BeginTabItem("Connection")) {
+                    ImGui::Text("Processes");
+                    ImGui::Separator();
 
-            // Left Sidebar
-            ImGui::Text("Processes");
-            ImGui::Separator();
+                    if (ImGui::Button("Refresh", ImVec2(-1, 0))) processes = GetProcesses();
+                    ImGui::InputText("Filter", filter_buf, IM_ARRAYSIZE(filter_buf));
 
-            if (ImGui::Button("Refresh", ImVec2(-1, 0))) processes = GetProcesses();
-            ImGui::InputText("Filter", filter_buf, IM_ARRAYSIZE(filter_buf));
+                    ImGui::BeginChild("Procs", ImVec2(0, -40), true);
+                    for (const auto& p : processes) {
+                        std::string filterStr = filter_buf;
+                        std::string nameStr = p.name;
 
-            ImGui::BeginChild("Procs", ImVec2(0, -40), true);
-            for (const auto& p : processes) {
-                std::string filterStr = filter_buf;
-                std::string nameStr = p.name;
+                        // Case insensitive search
+                        auto it = std::search(
+                            nameStr.begin(), nameStr.end(),
+                            filterStr.begin(), filterStr.end(),
+                            [](char c1, char c2) { return std::toupper(c1) == std::toupper(c2); }
+                        );
+                        bool nameMatch = (it != nameStr.end());
+                        bool pidMatch = std::to_string(p.pid).find(filterStr) != std::string::npos;
 
-                // Case insensitive search
-                auto it = std::search(
-                    nameStr.begin(), nameStr.end(),
-                    filterStr.begin(), filterStr.end(),
-                    [](char c1, char c2) { return std::toupper(c1) == std::toupper(c2); }
-                );
-                bool nameMatch = (it != nameStr.end());
-                bool pidMatch = std::to_string(p.pid).find(filterStr) != std::string::npos;
+                        if (filter_buf[0] && !nameMatch && !pidMatch) continue;
 
-                if (filter_buf[0] && !nameMatch && !pidMatch) continue;
-
-                std::string label = std::to_string(p.pid) + " - " + p.name;
-                if (ImGui::Selectable(label.c_str(), selected_pid == (int)p.pid)) selected_pid = p.pid;
-            }
-            ImGui::EndChild();
-
-            if (selected_pid > 0) {
-                 if (ImGui::Button("Inject", ImVec2(-1, 0))) {
-                    if (InjectLibrary(selected_pid, agentPath)) output_log += "[Sys] Injected.\n";
-                    else output_log += "[Sys] Injection Failed.\n";
-                }
-            } else {
-                 ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-                 ImGui::Button("Inject", ImVec2(-1, 0));
-                 ImGui::PopStyleVar();
-            }
-
-            ImGui::NextColumn();
-
-            // Right Main Area
-            ImGui::Text("Script Editor");
-            ImGui::SameLine();
-            if (ImGui::Button("Load")) {
-                char filename[256] = "script.lua";
-                // Simple load (ideally file dialog, but kept simple for now)
-                std::ifstream t(filename);
-                if (t.is_open()) {
-                    std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-                    if (str.length() < IM_ARRAYSIZE(script_buffer)) {
-                        strcpy_s(script_buffer, str.c_str());
-                        output_log += "[Sys] Loaded script.lua\n";
-                    } else {
-                        output_log += "[Sys] Script too large for buffer.\n";
+                        std::string label = std::to_string(p.pid) + " - " + p.name;
+                        if (ImGui::Selectable(label.c_str(), selected_pid == (int)p.pid)) selected_pid = p.pid;
                     }
-                } else {
-                    output_log += "[Sys] Failed to open script.lua\n";
+                    ImGui::EndChild();
+
+                    if (selected_pid > 0) {
+                         if (ImGui::Button("Inject", ImVec2(-1, 0))) {
+                            if (InjectLibrary(selected_pid, agentPath)) output_log += "[Sys] Injected.\n";
+                            else output_log += "[Sys] Injection Failed.\n";
+                        }
+                    } else {
+                         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+                         ImGui::Button("Inject", ImVec2(-1, 0));
+                         ImGui::PopStyleVar();
+                    }
+                    ImGui::EndTabItem();
                 }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Save")) {
-                std::ofstream t("script.lua");
-                if (t.is_open()) {
-                    t << script_buffer;
-                    output_log += "[Sys] Saved to script.lua\n";
-                } else {
-                    output_log += "[Sys] Failed to save script.lua\n";
+
+                if (ImGui::BeginTabItem("Players")) {
+                    if (ImGui::Button("Scan Players") && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_SCAN_PLAYERS, "");
+                    }
+                    ImGui::Separator();
+                    ImGui::TextWrapped("Results will appear in Logs for now (Table view TODO)");
+                    ImGui::EndTabItem();
                 }
+
+                if (ImGui::BeginTabItem("Registry")) {
+                    if (ImGui::Button("Dump Registry") && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_DUMP_REGISTRY, "");
+                    }
+                    ImGui::Separator();
+                    ImGui::TextWrapped("Results will appear in Logs");
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Scripts")) {
+                    if (ImGui::Button("Scan Scripts") && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_DUMP_SCRIPTS, "");
+                    }
+                    ImGui::Separator();
+                    ImGui::TextWrapped("Results will appear in Logs");
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Executor")) {
+                    ImGui::Text("Script Editor");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load")) {
+                        char filename[256] = "script.lua";
+                        std::ifstream t(filename);
+                        if (t.is_open()) {
+                            std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
+                            if (str.length() < IM_ARRAYSIZE(script_buffer)) {
+                                strcpy_s(script_buffer, str.c_str());
+                                output_log += "[Sys] Loaded script.lua\n";
+                            } else {
+                                output_log += "[Sys] Script too large for buffer.\n";
+                            }
+                        } else {
+                            output_log += "[Sys] Failed to open script.lua\n";
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Save")) {
+                        std::ofstream t("script.lua");
+                        if (t.is_open()) {
+                            t << script_buffer;
+                            output_log += "[Sys] Saved to script.lua\n";
+                        } else {
+                            output_log += "[Sys] Failed to save script.lua\n";
+                        }
+                    }
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+                    if (ImGui::Button("Clear Log")) { output_log.clear(); }
+
+                    ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 250));
+
+                    if (ImGui::Button("Run Script", ImVec2(100, 0)) && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
+                    }
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
             }
-            ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-            if (ImGui::Button("Clear Log")) { output_log.clear(); }
 
-            ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 250));
-
-            if (ImGui::Button("Run Script", ImVec2(100, 0)) && selected_pid > 0) {
-                RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Dump Globals", ImVec2(100, 0)) && selected_pid > 0) {
-                RemoteAgent::Get().Send(selected_pid, CMD_DUMP_GLOBALS, "");
-            }
-
-            // Progress Bar
-            static float progress = 0.0f;
-            static char progressText[128] = "";
-
-            // Check logs for progress
-            // In a real app we'd have a callback or event, but parsing logs works for this demo
+            // Process Logs
             auto logs = RemoteAgent::Get().ConsumeLogs();
             for (const auto& l : logs) {
                 output_log += l + "\n";
-                if (l.find("[Progress]") != std::string::npos) {
-                    // Extract info if needed, for now just animate
-                    progress += 0.1f;
-                    if (progress > 1.0f) progress = 0.0f;
-                    strncpy(progressText, l.c_str(), 127);
-                } else if (l.find("[OK] Finished") != std::string::npos) {
-                    progress = 1.0f;
-                    strncpy(progressText, "Done.", 127);
-                }
             }
 
-            if (progress > 0.0f && progress < 1.0f) {
-                ImGui::ProgressBar(progress, ImVec2(0.0f, 0.0f), progressText);
-                ImGui::SameLine();
-                ImGui::Text("Working...");
+            // Progress Bar
+            if (RemoteAgent::Get().IsBusy()) {
+                std::string status = RemoteAgent::Get().GetStatusText();
+                // Indeterminate progress bar using time
+                float time = (float)ImGui::GetTime();
+                float progress = fmodf(time, 1.0f);
+                ImGui::ProgressBar(progress, ImVec2(-1, 0), status.c_str());
             }
 
             ImGui::Separator();

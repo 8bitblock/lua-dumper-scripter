@@ -37,6 +37,16 @@ int main() {
     lua_State* L = p_luaL_newstate();
     p_luaL_openlibs(L);
 
+    // Setup Dummy Environment
+    const char* init_script = R"(
+        Players = {
+            LocalPlayer = { Name = "PlayerOne", Addr = "0x123456" },
+            OtherPlayer = { Name = "PlayerTwo", Addr = "0xABCDEF" }
+        }
+        _G.SecretFunction = function() print("I am hidden") end
+    )";
+    if (p_luaL_loadstring(L, init_script) == 0) p_lua_pcallk(L, 0, 0, 0, 0, NULL);
+
     std::cout << "Dummy Target (Windows) Running. PID: " << GetCurrentProcessId() << std::endl;
 
     while (true) {

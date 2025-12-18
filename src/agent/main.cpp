@@ -6,7 +6,7 @@
 #include <queue>
 #include <atomic>
 #include <psapi.h>
-#include "ipc.h"
+#include "../common/lua_ipc.h"
 
 // ----------------------------------------------------------------------------
 // Lua Function Definitions
@@ -23,6 +23,7 @@ typedef int         (*lua_type_t)(lua_State *L, int idx);
 typedef const char* (*lua_typename_t)(lua_State *L, int tp);
 typedef double      (*lua_tonumber_t)(lua_State *L, int idx);
 typedef int         (*lua_toboolean_t)(lua_State *L, int idx);
+typedef const void* (*lua_topointer_t)(lua_State *L, int idx);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
 typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
@@ -42,7 +43,10 @@ public:
 
     // API Wrappers
     bool LoadScript(const std::string& script, std::string& error);
-    std::string DumpGlobals();
+    void DumpGlobals(HANDLE hPipe);
+    void ScanPlayers(HANDLE hPipe);
+    void DumpRegistry(HANDLE hPipe);
+    void DumpScripts(HANDLE hPipe);
 
     // Hooking
     void EnableHook();
@@ -73,6 +77,7 @@ private:
     lua_typename_t  p_typename = nullptr;
     lua_tonumber_t  p_tonumber = nullptr;
     lua_toboolean_t p_toboolean = nullptr;
+    lua_topointer_t p_topointer = nullptr;
     lua_pcallk_t    p_pcallk = nullptr;
 
     // Loaders
@@ -95,6 +100,7 @@ private:
     friend int MyLuaLoadString(lua_State* L, const char* s);
     friend int MyLuaPcall(lua_State *L, int nargs, int nresults, int errfunc);
     friend int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
+    friend void MyLuaSetTop(lua_State *L, int idx);
     friend void HookProcessHelper(LuaInterface& lua, lua_State* L);
 };
 
@@ -174,6 +180,15 @@ int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, vo
     return ret;
 }
 
+void MyLuaSetTop(lua_State *L, int idx) {
+    auto& lua = LuaInterface::Get();
+    HookProcessHelper(lua, L);
+
+    lua.DisableHook();
+    lua.p_settop(L, idx);
+    lua.EnableHook();
+}
+
 // ----------------------------------------------------------------------------
 // LuaInterface Implementation
 // ----------------------------------------------------------------------------
@@ -241,6 +256,7 @@ void LuaInterface::ResolveSymbols(HMODULE hMod) {
     p_typename = (lua_typename_t)GetProcAddress(hMod, "lua_typename");
     p_tonumber = (lua_tonumber_t)GetProcAddress(hMod, "lua_tonumber");
     p_toboolean = (lua_toboolean_t)GetProcAddress(hMod, "lua_toboolean");
+    p_topointer = (lua_topointer_t)GetProcAddress(hMod, "lua_topointer");
 
     // Pcall variants
     p_pcallk = (lua_pcallk_t)GetProcAddress(hMod, "lua_pcallk");
@@ -264,6 +280,8 @@ void LuaInterface::ResolveSymbols(HMODULE hMod) {
 
     if (p_pcallk) AddHook((void*)p_pcallk, (void*)MyLuaPcallK, "lua_pcallk");
     else if (GetProcAddress(hMod, "lua_pcall")) AddHook((void*)GetProcAddress(hMod, "lua_pcall"), (void*)MyLuaPcall, "lua_pcall");
+
+    if (p_settop) AddHook((void*)p_settop, (void*)MyLuaSetTop, "lua_settop");
 
     if (p_loadbufferx) AddHook((void*)p_loadbufferx, (void*)MyLuaLoadBufferX, "luaL_loadbufferx");
     if (p_loadstring) AddHook((void*)p_loadstring, (void*)MyLuaLoadString, "luaL_loadstring");
@@ -333,22 +351,32 @@ bool LuaInterface::LoadScript(const std::string& script, std::string& error) {
     }
 }
 
-std::string LuaInterface::DumpGlobals() {
-    if (!m_L) return "Lua State not ready.";
+void LuaInterface::DumpGlobals(HANDLE hPipe) {
+    if (!m_L) {
+        std::string msg = "Lua State not ready.";
+        MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+        return;
+    }
 
     // Find _G
     typedef void (*lua_getglobal_t)(lua_State*, const char*);
     lua_getglobal_t p_getglobal = (lua_getglobal_t)GetProcAddress(m_hLua, "lua_getglobal");
 
-    if (!p_getglobal) return "lua_getglobal not found (Macro?). Use a script to iterate _G instead.";
+    if (!p_getglobal) {
+        std::string msg = "lua_getglobal not found.";
+        MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+        return;
+    }
 
     std::string out;
-    out.reserve(1024 * 1024); // Reserve 1MB to minimize reallocations
-    out = "Globals Dump (Limited to 2000 items):\n";
+    out.reserve(4096);
 
-    // Ensure we have stack space
-    // lua_checkstack is often a macro or function, we don't have it resolved.
-    // But standard lua stack is usually enough for this simple iteration.
+    // Initial Header
+    out = "Globals Dump (Streaming):\n";
 
     p_getglobal(m_L, "_G");
     if (p_gettop(m_L) > 0) {
@@ -356,11 +384,26 @@ std::string LuaInterface::DumpGlobals() {
         int count = 0;
         // Iterate _G
         while (p_next(m_L, -2) != 0) {
-            if (count++ > 2000) { // Limit items to prevent timeout/freeze
-                out.append("... [Output Truncated] ...\n");
-                // Pop value AND key to clean stack before breaking
-                // Stack is: _G, key, val. We need it to be: _G.
-                // p_settop(L, -3) pops 2 elements (val, key).
+            // Check Progress
+            count++;
+            if (count % 50 == 0) {
+                // Send Chunk if valid
+                if (!out.empty()) {
+                    MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+                    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+                    WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+                    out.clear();
+                }
+
+                // Send Progress
+                std::string prog = "Dumped " + std::to_string(count) + " items...";
+                MessageHeader h = { (uint32_t)prog.size(), RESP_PROGRESS };
+                DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+                WriteFile(hPipe, prog.data(), prog.size(), &w, NULL);
+            }
+
+            if (count > 5000) { // Limit items
+                out.append("... [Output Truncated > 5000] ...\n");
                 p_settop(m_L, -3);
                 break;
             }
@@ -408,7 +451,159 @@ std::string LuaInterface::DumpGlobals() {
         }
         p_settop(m_L, -2); // pop _G
     }
-    return out;
+
+    // Send Remaining Chunk
+    if (!out.empty()) {
+        MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+    }
+}
+
+void LuaInterface::ScanPlayers(HANDLE hPipe) {
+    if (!m_L) return;
+
+    // Look for "Players" global
+    // Stack: 0
+    typedef void (*lua_getglobal_t)(lua_State*, const char*);
+    lua_getglobal_t p_getglobal = (lua_getglobal_t)GetProcAddress(m_hLua, "lua_getglobal");
+    if (!p_getglobal) return;
+
+    p_getglobal(m_L, "Players");
+    if (p_type(m_L, -1) != 5) { // LUA_TTABLE = 5
+        std::string err = "Global 'Players' table not found.";
+        MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, err.data(), err.size(), &w, NULL);
+        p_settop(m_L, -2);
+        return;
+    }
+
+    // Iterate Players
+    // Stack: Players
+    p_pushnil(m_L);
+    // Stack: Players, nil
+    std::string out;
+    out = "Scan Players Results:\n";
+
+    while (p_next(m_L, -2) != 0) {
+        // Stack: Players, Key, Value
+        // Assuming Key is PlayerName or Index, Value is Player Object (Table/Userdata)
+
+        // Try to get Name from Key
+        const char* key = NULL;
+        if (p_type(m_L, -2) == 4) { // String Key
+             key = p_tolstring(m_L, -2, NULL);
+        }
+
+        out.append(key ? key : "[Unknown Key]");
+        out.append(" | Addr: ");
+
+        // Get Pointer
+        const void* ptr = p_topointer ? p_topointer(m_L, -1) : nullptr;
+        char addrBuf[32];
+        sprintf_s(addrBuf, "%p", ptr);
+        out.append(addrBuf);
+        out.append("\n");
+
+        p_settop(m_L, -2); // pop value
+    }
+    p_settop(m_L, -2); // pop Players
+
+    MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+    WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+}
+
+void LuaInterface::DumpRegistry(HANDLE hPipe) {
+    if (!m_L) return;
+
+    // LUA_REGISTRYINDEX is usually -10000 or similar macro.
+    // In standard Lua 5.4, it's (-1001000) (LUAI_FIRSTPSEUDOIDX)
+    // But we can't rely on macro value here safely without headers.
+    // However, lua_getregistry is not a standard function, usually a macro calling lua_pushvalue(L, LUA_REGISTRYINDEX)? No.
+    // Actually, to iterate registry, we need the index.
+    // Let's guess standard 5.4 index: -1001000
+    int registry_index = -1001000;
+
+    std::string out = "Registry Dump:\n";
+
+    p_pushvalue(m_L, registry_index); // Push Registry
+    if (p_type(m_L, -1) != 5) {
+        out = "Failed to push Registry (Invalid Index?).";
+    } else {
+        p_pushnil(m_L);
+        int count = 0;
+        while (p_next(m_L, -2) != 0) {
+            if (count++ > 1000) {
+                out.append("... Truncated ...\n");
+                p_settop(m_L, -3);
+                break;
+            }
+            // Key
+            int kType = p_type(m_L, -2);
+            if (kType == 3) out.append(std::to_string((int)p_tonumber(m_L, -2)));
+            else if (kType == 4) out.append(p_tolstring(m_L, -2, NULL));
+            else out.append(p_typename(m_L, kType));
+
+            out.append(" = ");
+
+            // Value
+            int vType = p_type(m_L, -1);
+            out.append(p_typename(m_L, vType));
+            out.append("\n");
+
+            p_settop(m_L, -2);
+        }
+    }
+    p_settop(m_L, -2); // Pop Registry
+
+    MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+    WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+}
+
+void LuaInterface::DumpScripts(HANDLE hPipe) {
+    // Iterate _G looking for functions and get info
+    if (!m_L) return;
+
+    typedef void (*lua_getglobal_t)(lua_State*, const char*);
+    lua_getglobal_t p_getglobal = (lua_getglobal_t)GetProcAddress(m_hLua, "lua_getglobal");
+
+    typedef int (*lua_getinfo_t)(lua_State*, const char*, void*); // lua_Debug* is void* here
+    lua_getinfo_t p_getinfo = (lua_getinfo_t)GetProcAddress(m_hLua, "lua_getinfo");
+
+    if (!p_getglobal || !p_getinfo) return;
+
+    std::string out = "Discovered Scripts (Functions in _G):\n";
+
+    p_getglobal(m_L, "_G");
+    p_pushnil(m_L);
+    while (p_next(m_L, -2) != 0) {
+        if (p_type(m_L, -1) == 6) { // LUA_TFUNCTION
+             const char* key = p_tolstring(m_L, -2, NULL);
+             out.append("Function: ");
+             out.append(key ? key : "?");
+
+             // Get Info
+             // struct lua_Debug is large, let's allocate enough buffer
+             char debugBuf[256];
+             // We need to be careful with struct layout.
+             // Safer to not use getinfo if we don't have the struct definition.
+             // But we can try to push it on stack and check?
+             // Actually, `lua_getinfo` writes to a struct. Without correct struct layout matching the DLL version, this will CRASH.
+             // We cannot safely use lua_getinfo without the header definition matching the DLL.
+             // SKIPPING DETAILED INFO for safety.
+
+             out.append(" [Lua Function]\n");
+        }
+        p_settop(m_L, -2);
+    }
+    p_settop(m_L, -2);
+
+    MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+    WriteFile(hPipe, out.data(), out.size(), &w, NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -467,11 +662,22 @@ bool LuaInterface::ProcessTasks() {
                 DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
                 WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
             } else {
-                std::string data = DumpGlobals();
-                MessageHeader h = { (uint32_t)data.size(), RESP_DATA };
+                DumpGlobals(t.pipe);
+                MessageHeader h = { 0, RESP_OK };
                 DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-                WriteFile(t.pipe, data.data(), data.size(), &w, NULL);
             }
+        } else if (t.type == CMD_SCAN_PLAYERS) {
+            ScanPlayers(t.pipe);
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_DUMP_REGISTRY) {
+            DumpRegistry(t.pipe);
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_DUMP_SCRIPTS) {
+            DumpScripts(t.pipe);
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
         }
         CloseHandle(t.pipe);
     }
