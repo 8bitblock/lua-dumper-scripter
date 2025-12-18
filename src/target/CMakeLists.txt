@@ -1,5 +1,0 @@
-find_package(Lua REQUIRED)
-add_executable(dummy_target main.cpp)
-target_include_directories(dummy_target PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(dummy_target ${LUA_LIBRARIES} dl)
-set_target_properties(dummy_target PROPERTIES LINK_FLAGS "-rdynamic")

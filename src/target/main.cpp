@@ -1,41 +1,53 @@
-#include <lua.hpp>
+#include <windows.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
-#include <unistd.h>
 
-lua_State* G_LuaState = nullptr;
-
-extern "C" {
-    // Export this symbol for the agent to find
-    lua_State* GetGlobalState() {
-        return G_LuaState;
-    }
-}
+// We don't link Lua here, we LoadLibrary it to simulate a game using lua54.dll
+typedef struct lua_State lua_State;
+typedef lua_State* (*luaL_newstate_t)();
+typedef void (*luaL_openlibs_t)(lua_State*);
+typedef int (*luaL_loadstring_t)(lua_State*, const char*);
+typedef int (*lua_pcallk_t)(lua_State*, int, int, int, long, void*);
+typedef void (*lua_close_t)(lua_State*);
 
 int main() {
-    lua_State* L = luaL_newstate();
-    G_LuaState = L; // Set global
+    HMODULE hLua = LoadLibraryA("lua54.dll");
+    if (!hLua) {
+        // Fallback name
+        hLua = LoadLibraryA("lua5.4.dll");
+    }
 
-    luaL_openlibs(L);
+    if (!hLua) {
+        std::cerr << "Could not load lua54.dll. Make sure it is in the same folder." << std::endl;
+        return 1;
+    }
 
-    // Define some dummy globals
-    lua_pushinteger(L, 42);
-    lua_setglobal(L, "Answer");
+    auto p_luaL_newstate = (luaL_newstate_t)GetProcAddress(hLua, "luaL_newstate");
+    auto p_luaL_openlibs = (luaL_openlibs_t)GetProcAddress(hLua, "luaL_openlibs");
+    auto p_luaL_loadstring = (luaL_loadstring_t)GetProcAddress(hLua, "luaL_loadstring");
+    auto p_lua_pcallk = (lua_pcallk_t)GetProcAddress(hLua, "lua_pcallk");
+    auto p_lua_close = (lua_close_t)GetProcAddress(hLua, "lua_close");
 
-    lua_pushstring(L, "LuaTool Dummy");
-    lua_setglobal(L, "AppName");
+    if (!p_luaL_newstate) {
+        std::cerr << "Missing symbols in lua dll." << std::endl;
+        return 1;
+    }
 
-    // Define a function
-    luaL_dostring(L, "function MyFunc(a, b) return a + b end");
+    lua_State* L = p_luaL_newstate();
+    p_luaL_openlibs(L);
 
-    std::cout << "Dummy Target Running. PID: " << getpid() << std::endl;
+    std::cout << "Dummy Target (Windows) Running. PID: " << GetCurrentProcessId() << std::endl;
 
     while (true) {
-        luaL_dostring(L, "print('Tick: ' .. os.time())");
+        // Run a simple script every few seconds
+        const char* script = "print('Target Tick: ' .. os.time())";
+        if (p_luaL_loadstring(L, script) == 0) {
+            p_lua_pcallk(L, 0, 0, 0, 0, NULL);
+        }
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 
-    lua_close(L);
+    p_lua_close(L);
     return 0;
 }

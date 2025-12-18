@@ -2,149 +2,202 @@
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_opengl3.h>
 #include <SDL.h>
-#include <GL/gl.h>
+#include <SDL_opengl.h>
+#include <windows.h>
+#include <tlhelp32.h>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <dirent.h>
-#include <fstream>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include <queue>
+#include <mutex>
+#include <atomic>
+#include <thread>
 #include "ipc.h"
 
 // Forward declare Injector
-bool InjectLibrary(pid_t pid, const std::string& library_path);
+bool InjectLibrary(DWORD pid, const std::string& library_path);
 
 struct ProcessInfo {
-    int pid;
+    DWORD pid;
     std::string name;
 };
 
 std::vector<ProcessInfo> GetProcesses() {
     std::vector<ProcessInfo> list;
-    DIR* dir = opendir("/proc");
-    if (!dir) return list;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return list;
 
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (isdigit(ent->d_name[0])) {
-            int pid = atoi(ent->d_name);
-            std::string cmdpath = std::string("/proc/") + ent->d_name + "/comm";
-            std::ifstream cmdfile(cmdpath);
-            std::string name;
-            if (std::getline(cmdfile, name)) {
-                list.push_back({pid, name});
-            }
-        }
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(hSnap, &pe32)) {
+        do {
+            #ifdef UNICODE
+            char name[MAX_PATH];
+            size_t c;
+            wcstombs_s(&c, name, MAX_PATH, pe32.szExeFile, MAX_PATH);
+            list.push_back({ pe32.th32ProcessID, std::string(name) });
+            #else
+            list.push_back({ pe32.th32ProcessID, std::string(pe32.szExeFile) });
+            #endif
+        } while (Process32Next(hSnap, &pe32));
     }
-    closedir(dir);
+    CloseHandle(hSnap);
     return list;
 }
 
-int client_sock = -1;
+// ----------------------------------------------------------------------------
+// Remote Agent Class (IPC Wrapper)
+// ----------------------------------------------------------------------------
+class RemoteAgent {
+public:
+    struct Command {
+        DWORD pid;
+        MessageType type;
+        std::string payload;
+    };
 
-bool ConnectToAgent(int pid) {
-    if (client_sock != -1) close(client_sock);
-
-    std::string sock_path = "/tmp/luatool_" + std::to_string(pid) + ".sock";
-
-    // Retry a few times as the agent initializes
-    for (int i = 0; i < 10; i++) {
-        client_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-        struct sockaddr_un addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
-
-        if (connect(client_sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            return true;
-        }
-        close(client_sock);
-        client_sock = -1;
-        usleep(500000); // 0.5s
+    static RemoteAgent& Get() {
+        static RemoteAgent instance;
+        return instance;
     }
-    return false;
-}
 
-void SendScript(const std::string& script) {
-    if (client_sock == -1) return;
+    void Start() {
+        if (m_Running) return;
+        m_Running = true;
+        m_Worker = std::thread(&RemoteAgent::WorkerLoop, this);
+        m_Worker.detach();
+    }
 
-    MessageHeader header;
-    header.type = CMD_RUN_SCRIPT;
-    header.length = script.size();
+    void Send(DWORD pid, MessageType type, const std::string& payload) {
+        std::lock_guard<std::mutex> lock(m_QueueMutex);
+        m_Queue.push({ pid, type, payload });
+    }
 
-    send(client_sock, &header, sizeof(header), 0);
-    send(client_sock, script.data(), script.size(), 0);
-}
+    std::vector<std::string> ConsumeLogs() {
+        std::lock_guard<std::mutex> lock(m_LogMutex);
+        std::vector<std::string> logs = m_PendingLogs;
+        m_PendingLogs.clear();
+        return logs;
+    }
 
-void RequestDump() {
-    if (client_sock == -1) return;
+private:
+    RemoteAgent() = default;
 
-    MessageHeader header;
-    header.type = CMD_DUMP_GLOBALS;
-    header.length = 0;
-    send(client_sock, &header, sizeof(header), 0);
-}
+    void Log(const std::string& msg) {
+        std::lock_guard<std::mutex> lock(m_LogMutex);
+        m_PendingLogs.push_back(msg);
+    }
 
-// Global UI state
+    void WorkerLoop() {
+        while (m_Running) {
+            Command cmd;
+            bool hasCmd = false;
+            {
+                std::lock_guard<std::mutex> lock(m_QueueMutex);
+                if (!m_Queue.empty()) {
+                    cmd = m_Queue.front();
+                    m_Queue.pop();
+                    hasCmd = true;
+                }
+            }
+
+            if (hasCmd) {
+                ProcessCommand(cmd);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    }
+
+    void ProcessCommand(const Command& cmd) {
+        char pipeName[256];
+        sprintf_s(pipeName, "\\\\.\\pipe\\luatool_%lu", cmd.pid);
+
+        if (!WaitNamedPipeA(pipeName, 2000)) {
+            Log("[Error] Pipe not ready. Error: " + std::to_string(GetLastError()));
+            return;
+        }
+
+        HANDLE hPipe = CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            Log("[Error] Failed to connect. Error: " + std::to_string(GetLastError()));
+            return;
+        }
+
+        DWORD mode = PIPE_READMODE_MESSAGE;
+        SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
+
+        // Send Request
+        MessageHeader header = { (uint32_t)cmd.payload.size(), cmd.type };
+        DWORD w;
+        if (!WriteFile(hPipe, &header, sizeof(header), &w, NULL)) {
+            Log("[Error] Write Header Failed. Error: " + std::to_string(GetLastError()));
+            CloseHandle(hPipe);
+            return;
+        }
+        if (header.length > 0) {
+            if (!WriteFile(hPipe, cmd.payload.data(), header.length, &w, NULL)) {
+                Log("[Error] Write Payload Failed. Error: " + std::to_string(GetLastError()));
+                CloseHandle(hPipe);
+                return;
+            }
+        }
+
+        // Wait for response
+        bool dataReady = false;
+        for (int i = 0; i < 50; i++) {
+            DWORD avail = 0;
+            if (PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+                dataReady = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!dataReady) {
+            Log("[Timeout] Agent did not respond after 5 seconds.");
+            CloseHandle(hPipe);
+            return;
+        }
+
+        MessageHeader resp;
+        DWORD r;
+        if (ReadFile(hPipe, &resp, sizeof(resp), &r, NULL)) {
+            std::string body;
+            if (resp.length > 0) {
+                std::vector<char> buf(resp.length);
+                ReadFile(hPipe, buf.data(), resp.length, &r, NULL);
+                body.assign(buf.begin(), buf.end());
+            }
+            if (resp.type == RESP_OK) Log("[OK] Executed.");
+            else if (resp.type == RESP_ERROR) Log("[Lua Error] " + body);
+            else if (resp.type == RESP_DATA) Log(body);
+        } else {
+            Log("[Error] Read Response Failed. Error: " + std::to_string(GetLastError()));
+        }
+        CloseHandle(hPipe);
+    }
+
+    std::mutex m_QueueMutex;
+    std::queue<Command> m_Queue;
+
+    std::mutex m_LogMutex;
+    std::vector<std::string> m_PendingLogs;
+
+    std::thread m_Worker;
+    std::atomic<bool> m_Running = false;
+};
+
+// ----------------------------------------------------------------------------
+// GUI Main
+// ----------------------------------------------------------------------------
 int selected_pid = -1;
-std::string status_msg = "Idle";
-std::string output_log = "";
-char script_buffer[1024 * 16] = "print('Hello from LuaTool!')\nprint('Answer is ' .. (Answer or 'nil'))";
-
-void ProcessIPC() {
-    if (client_sock == -1) return;
-
-    // Check for data without blocking
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(client_sock, &readfds);
-    struct timeval tv = {0, 0};
-
-    if (select(client_sock + 1, &readfds, NULL, NULL, &tv) > 0) {
-        MessageHeader header;
-        ssize_t n = recv(client_sock, &header, sizeof(header), MSG_PEEK); // peek header
-        if (n == 0) {
-             // Closed
-             close(client_sock);
-             client_sock = -1;
-             status_msg = "Disconnected";
-             return;
-        }
-
-        if (n >= sizeof(header)) {
-             recv(client_sock, &header, sizeof(header), 0); // consume header
-
-             std::vector<char> buffer(header.length);
-             if (header.length > 0) {
-                 // Loop to ensure full read
-                 size_t total = 0;
-                 while(total < header.length) {
-                     ssize_t r = recv(client_sock, buffer.data() + total, header.length - total, 0);
-                     if(r <= 0) break;
-                     total += r;
-                 }
-             }
-
-             std::string payload(buffer.begin(), buffer.end());
-
-             if (header.type == RESP_OK) {
-                 output_log += "[OK] Script executed successfully.\n";
-             } else if (header.type == RESP_ERROR) {
-                 output_log += "[ERROR] " + payload + "\n";
-             } else if (header.type == RESP_DATA) {
-                 output_log += "[DATA] " + payload + "\n";
-             }
-        }
-    }
-}
+std::string output_log;
+char script_buffer[16384] = "print('Hello')";
+char filter_buf[128] = "";
 
 int main(int, char**) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
-        printf("Error: %s\n", SDL_GetError());
-        return -1;
-    }
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) return -1;
 
     const char* glsl_version = "#version 130";
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
@@ -153,120 +206,91 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window* window = SDL_CreateWindow("LuaTool", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
-
+    SDL_Window* window = SDL_CreateWindow("LuaTool v2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     SDL_GL_MakeCurrent(window, gl_context);
-    SDL_GL_SetSwapInterval(1); // Enable vsync
+    SDL_GL_SetSwapInterval(1);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-
     ImGui::StyleColorsDark();
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
+    // Start Worker
+    RemoteAgent::Get().Start();
+
+    // Get Agent Path
+    char pathBuf[MAX_PATH];
+    GetModuleFileNameA(NULL, pathBuf, MAX_PATH);
+    std::string exePath = pathBuf;
+    std::string binDir = exePath.substr(0, exePath.find_last_of('\\'));
+    std::string agentPath = binDir + "\\agent.dll";
+
+    std::vector<ProcessInfo> processes = GetProcesses();
     bool done = false;
-    std::vector<ProcessInfo> processes;
-
-    // Build path to agent library
-    char path_buf[1024];
-    readlink("/proc/self/exe", path_buf, sizeof(path_buf));
-    std::string exe_path(path_buf);
-    std::string bin_dir = exe_path.substr(0, exe_path.find_last_of('/'));
-    // Usually we are in build/src/gui/luatool. Agent is in build/src/agent/libagent.so
-    // Let's assume standard cmake build layout relative to executable.
-    std::string agent_path = bin_dir + "/../agent/libagent.so";
-
-    // Verify agent path
-    if (access(agent_path.c_str(), F_OK) == -1) {
-        // Try fallback
-        agent_path = bin_dir + "/libagent.so";
-    }
 
     while (!done) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
-            if (event.type == SDL_QUIT)
-                done = true;
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window))
-                done = true;
+            if (event.type == SDL_QUIT) done = true;
+            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window)) done = true;
         }
-
-        ProcessIPC();
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
         {
-            ImGui::Begin("Lua Process Injector");
+            ImGui::Begin("LuaTool");
 
-            if (ImGui::Button("Refresh Processes")) {
-                processes = GetProcesses();
-            }
-
+            if (ImGui::Button("Refresh")) processes = GetProcesses();
             ImGui::SameLine();
-            ImGui::Text("Status: %s", status_msg.c_str());
+            ImGui::InputText("Filter", filter_buf, IM_ARRAYSIZE(filter_buf));
 
-            ImGui::BeginChild("ProcessList", ImVec2(0, 200), true);
+            ImGui::BeginChild("Procs", ImVec2(0, 200), true);
             for (const auto& p : processes) {
+                if (filter_buf[0] && p.name.find(filter_buf) == std::string::npos && std::to_string(p.pid).find(filter_buf) == std::string::npos) continue;
+
                 std::string label = std::to_string(p.pid) + " - " + p.name;
-                if (ImGui::Selectable(label.c_str(), selected_pid == p.pid)) {
-                    selected_pid = p.pid;
-                }
+                if (ImGui::Selectable(label.c_str(), selected_pid == (int)p.pid)) selected_pid = p.pid;
             }
             ImGui::EndChild();
 
-            if (ImGui::Button("Attach & Inject")) {
-                if (selected_pid > 0) {
-                    status_msg = "Injecting...";
-                    if (InjectLibrary(selected_pid, agent_path)) {
-                        status_msg = "Injected. Connecting...";
-                        if (ConnectToAgent(selected_pid)) {
-                            status_msg = "Connected!";
-                        } else {
-                            status_msg = "Injected, but connection failed.";
-                        }
-                    } else {
-                        status_msg = "Injection Failed.";
-                    }
-                }
+            if (ImGui::Button("Inject") && selected_pid > 0) {
+                if (InjectLibrary(selected_pid, agentPath)) output_log += "[Sys] Injected.\n";
+                else output_log += "[Sys] Injection Failed.\n";
             }
 
             ImGui::Separator();
+            ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 150));
 
-            if (client_sock != -1) {
-                ImGui::Text("Scripting");
-                ImGui::InputTextMultiline("##source", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 10));
-
-                if (ImGui::Button("Run Script")) {
-                     SendScript(script_buffer);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Dump Globals")) {
-                     RequestDump();
-                }
-
-                ImGui::Text("Output Log:");
-                ImGui::BeginChild("Log", ImVec2(0, 0), true);
-                ImGui::TextUnformatted(output_log.c_str());
-                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-                    ImGui::SetScrollHereY(1.0f);
-                ImGui::EndChild();
-            } else {
-                ImGui::TextDisabled("Attach to a process to enable scripting.");
+            if (ImGui::Button("Run") && selected_pid > 0) {
+                RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Dump Globals") && selected_pid > 0) {
+                RemoteAgent::Get().Send(selected_pid, CMD_DUMP_GLOBALS, "");
+            }
+
+            // Consume Logs
+            auto logs = RemoteAgent::Get().ConsumeLogs();
+            for (const auto& l : logs) output_log += l + "\n";
+
+            ImGui::BeginChild("Log", ImVec2(0, 0), true);
+            ImGui::TextUnformatted(output_log.c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+            ImGui::EndChild();
 
             ImGui::End();
         }
 
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
+        glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
@@ -275,7 +299,6 @@ int main(int, char**) {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
-
     SDL_GL_DeleteContext(gl_context);
     SDL_DestroyWindow(window);
     SDL_Quit();
