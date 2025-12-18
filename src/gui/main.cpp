@@ -91,6 +91,10 @@ public:
         std::lock_guard<std::mutex> lock(m_StatusMutex);
         return m_StatusText;
     }
+    std::string GetLastResult() {
+        std::lock_guard<std::mutex> lock(m_StatusMutex);
+        return m_LastResult;
+    }
 
 private:
     RemoteAgent() = default;
@@ -189,9 +193,13 @@ private:
 
             if (resp.type == RESP_OK) {
                 Log("[OK] Finished.");
+                std::lock_guard<std::mutex> lock(m_StatusMutex);
+                m_LastResult = "Done.";
                 break;
             } else if (resp.type == RESP_ERROR) {
                 Log("[Error] " + body);
+                std::lock_guard<std::mutex> lock(m_StatusMutex);
+                m_LastResult = "Error: " + body;
                 break;
             } else if (resp.type == RESP_DATA) {
                 Log(body);
@@ -218,6 +226,7 @@ private:
     std::atomic<bool> m_IsBusy{false};
     std::mutex m_StatusMutex;
     std::string m_StatusText;
+    std::string m_LastResult = "Ready";
 };
 
 // ----------------------------------------------------------------------------
@@ -227,6 +236,26 @@ int selected_pid = -1;
 std::string output_log;
 char script_buffer[16384] = "print('Hello')";
 char filter_buf[128] = "";
+
+// Data Caches
+std::vector<std::string> player_list;
+std::vector<std::string> registry_list;
+std::vector<std::string> script_list;
+std::string current_script_source;
+
+// Helper to parse | separated strings
+std::vector<std::string> ParseRow(const std::string& row) {
+    std::vector<std::string> cols;
+    size_t start = 0;
+    size_t end = row.find('|');
+    while (end != std::string::npos) {
+        cols.push_back(row.substr(start, end - start));
+        start = end + 1;
+        end = row.find('|', start);
+    }
+    cols.push_back(row.substr(start));
+    return cols;
+}
 
 int main(int argc, char* argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) return -1;
@@ -340,7 +369,28 @@ int main(int argc, char* argv[]) {
                         RemoteAgent::Get().Send(selected_pid, CMD_SCAN_PLAYERS, "");
                     }
                     ImGui::Separator();
-                    ImGui::TextWrapped("Results will appear in Logs for now (Table view TODO)");
+
+                    static char pFilter[64] = "";
+                    ImGui::InputText("Filter##P", pFilter, 64);
+
+                    if (ImGui::BeginTable("PlayersTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                        ImGui::TableSetupColumn("Name");
+                        ImGui::TableSetupColumn("Address");
+                        ImGui::TableSetupColumn("Position");
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& rowStr : player_list) {
+                            if (pFilter[0] && rowStr.find(pFilter) == std::string::npos) continue;
+                            auto cols = ParseRow(rowStr);
+                            if (cols.size() >= 1) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+                                if (cols.size() >= 2) { ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str()); }
+                                if (cols.size() >= 3) { ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str()); }
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
                     ImGui::EndTabItem();
                 }
 
@@ -349,7 +399,28 @@ int main(int argc, char* argv[]) {
                         RemoteAgent::Get().Send(selected_pid, CMD_DUMP_REGISTRY, "");
                     }
                     ImGui::Separator();
-                    ImGui::TextWrapped("Results will appear in Logs");
+
+                    static char rFilter[64] = "";
+                    ImGui::InputText("Filter##R", rFilter, 64);
+
+                    if (ImGui::BeginTable("RegistryTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                        ImGui::TableSetupColumn("Key");
+                        ImGui::TableSetupColumn("Type");
+                        ImGui::TableSetupColumn("Value");
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& rowStr : registry_list) {
+                            if (rFilter[0] && rowStr.find(rFilter) == std::string::npos) continue;
+                            auto cols = ParseRow(rowStr);
+                            if (cols.size() >= 3) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+                                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str());
+                                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str());
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
                     ImGui::EndTabItem();
                 }
 
@@ -358,7 +429,32 @@ int main(int argc, char* argv[]) {
                         RemoteAgent::Get().Send(selected_pid, CMD_DUMP_SCRIPTS, "");
                     }
                     ImGui::Separator();
-                    ImGui::TextWrapped("Results will appear in Logs");
+
+                    ImGui::BeginGroup();
+                    ImGui::BeginChild("ScriptList", ImVec2(250, 0), true);
+                    static int selectedScript = -1;
+                    for (int i = 0; i < (int)script_list.size(); i++) {
+                        std::vector<std::string> cols = ParseRow(script_list[i]);
+                        std::string name = cols.empty() ? "?" : cols[0];
+                        if (ImGui::Selectable(name.c_str(), selectedScript == i)) {
+                            selectedScript = i;
+                            current_script_source = "Loading...";
+                            if (selected_pid > 0) {
+                                RemoteAgent::Get().Send(selected_pid, CMD_GET_SCRIPT_SOURCE, name);
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndGroup();
+
+                    ImGui::SameLine();
+
+                    ImGui::BeginGroup();
+                    ImGui::BeginChild("ScriptSource", ImVec2(0, 0), true);
+                    ImGui::TextUnformatted(current_script_source.c_str());
+                    ImGui::EndChild();
+                    ImGui::EndGroup();
+
                     ImGui::EndTabItem();
                 }
 
@@ -390,32 +486,95 @@ int main(int argc, char* argv[]) {
                             output_log += "[Sys] Failed to save script.lua\n";
                         }
                     }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear Editor")) { script_buffer[0] = 0; }
+
                     ImGui::SameLine(ImGui::GetWindowWidth() - 80);
                     if (ImGui::Button("Clear Log")) { output_log.clear(); }
 
-                    ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 250));
+                    ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 200));
 
                     if (ImGui::Button("Run Script", ImVec2(100, 0)) && selected_pid > 0) {
                         RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
                     }
+
+                    ImGui::Separator();
+                    ImGui::Text("Script Overrides");
+                    static char overrideTarget[128] = "";
+                    ImGui::InputText("Target Script Name", overrideTarget, 128);
+
+                    if (ImGui::Button("Set Override from Editor") && selected_pid > 0) {
+                        if (strlen(overrideTarget) > 0) {
+                            std::string payload = std::string(overrideTarget) + "\n" + std::string(script_buffer);
+                            RemoteAgent::Get().Send(selected_pid, CMD_ADD_OVERRIDE, payload);
+                            output_log += "[Sys] Override set for " + std::string(overrideTarget) + "\n";
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset All Overrides") && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_RESET_OVERRIDES, "");
+                        output_log += "[Sys] Overrides reset.\n";
+                    }
+
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
             }
 
-            // Process Logs
+            // Process Logs and Data
             auto logs = RemoteAgent::Get().ConsumeLogs();
             for (const auto& l : logs) {
-                output_log += l + "\n";
+                if (l.find("Scan Players Results:") != std::string::npos) {
+                    player_list.clear();
+                    std::string data = l.substr(l.find('\n') + 1);
+                    size_t pos = 0;
+                    while ((pos = data.find('\n')) != std::string::npos) {
+                        player_list.push_back(data.substr(0, pos));
+                        data.erase(0, pos + 1);
+                    }
+                }
+                else if (l.find("Registry Dump:") != std::string::npos) {
+                    registry_list.clear();
+                    std::string data = l.substr(l.find('\n') + 1);
+                    size_t pos = 0;
+                    while ((pos = data.find('\n')) != std::string::npos) {
+                        registry_list.push_back(data.substr(0, pos));
+                        data.erase(0, pos + 1);
+                    }
+                }
+                else if (l.find("Discovered Scripts") != std::string::npos) {
+                    script_list.clear();
+                    std::string data = l.substr(l.find('\n') + 1);
+                    size_t pos = 0;
+                    while ((pos = data.find('\n')) != std::string::npos) {
+                        script_list.push_back(data.substr(0, pos));
+                        data.erase(0, pos + 1);
+                    }
+                }
+                else if (l.find("-- Source for") != std::string::npos || l.find("-- Override Found:") != std::string::npos) {
+                    current_script_source = l;
+                }
+                else {
+                    output_log += l + "\n";
+                }
             }
 
-            // Progress Bar
+            // Status Bar with Animation
+            ImGui::Separator();
             if (RemoteAgent::Get().IsBusy()) {
                 std::string status = RemoteAgent::Get().GetStatusText();
-                // Indeterminate progress bar using time
-                float time = (float)ImGui::GetTime();
-                float progress = fmodf(time, 1.0f);
-                ImGui::ProgressBar(progress, ImVec2(-1, 0), status.c_str());
+
+                // Dot animation
+                double time = ImGui::GetTime();
+                int dots = (int)(time * 2.0) % 4;
+                if (dots == 1) status += ".";
+                else if (dots == 2) status += "..";
+                else if (dots == 3) status += "...";
+
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", status.c_str());
+            } else {
+                std::string result = RemoteAgent::Get().GetLastResult();
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", result.c_str());
             }
 
             ImGui::Separator();

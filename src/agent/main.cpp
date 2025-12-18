@@ -5,6 +5,7 @@
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <map>
 #include <psapi.h>
 #include "../common/lua_ipc.h"
 
@@ -24,6 +25,7 @@ typedef const char* (*lua_typename_t)(lua_State *L, int tp);
 typedef double      (*lua_tonumber_t)(lua_State *L, int idx);
 typedef int         (*lua_toboolean_t)(lua_State *L, int idx);
 typedef const void* (*lua_topointer_t)(lua_State *L, int idx);
+typedef int         (*lua_getfield_t)(lua_State *L, int idx, const char *k);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
 typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
@@ -47,6 +49,7 @@ public:
     void ScanPlayers(HANDLE hPipe);
     void DumpRegistry(HANDLE hPipe);
     void DumpScripts(HANDLE hPipe);
+    void GetScriptSource(HANDLE hPipe, const std::string& name);
 
     // Hooking
     void EnableHook();
@@ -57,14 +60,35 @@ public:
     void SetState(lua_State* L) { m_L = L; }
     lua_State* GetState() const { return m_L; }
 
+    void AddOverride(const std::string& name, const std::string& source) {
+        std::lock_guard<std::mutex> lock(m_OverrideMutex);
+        m_ScriptOverrides[name] = source;
+    }
+
+    void ResetOverrides() {
+        std::lock_guard<std::mutex> lock(m_OverrideMutex);
+        m_ScriptOverrides.clear();
+    }
+
+    std::string GetOverride(const std::string& name) {
+        std::lock_guard<std::mutex> lock(m_OverrideMutex);
+        auto it = m_ScriptOverrides.find(name);
+        if (it != m_ScriptOverrides.end()) return it->second;
+        return "";
+    }
+
 private:
     LuaInterface() = default;
-    void ResolveSymbols(HMODULE hMod);
+    bool ResolveSymbols(HMODULE hMod);
 
     // State
     lua_State* m_L = nullptr;
     bool m_Loaded = false;
     HMODULE m_hLua = NULL;
+
+    // Overrides
+    std::mutex m_OverrideMutex;
+    std::map<std::string, std::string> m_ScriptOverrides;
 
     // Functions
     lua_gettop_t    p_gettop = nullptr;
@@ -78,6 +102,7 @@ private:
     lua_tonumber_t  p_tonumber = nullptr;
     lua_toboolean_t p_toboolean = nullptr;
     lua_topointer_t p_topointer = nullptr;
+    lua_getfield_t  p_getfield = nullptr;
     lua_pcallk_t    p_pcallk = nullptr;
 
     // Loaders
@@ -138,7 +163,19 @@ int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name
     HookProcessHelper(lua, L);
 
     lua.DisableHook();
-    int ret = lua.p_loadbufferx(L, buff, sz, name, mode);
+
+    // Check Override
+    std::string overrideSrc;
+    if (name) overrideSrc = lua.GetOverride(name);
+
+    int ret;
+    if (!overrideSrc.empty()) {
+        std::cout << "[Agent] Applying Override for: " << name << std::endl;
+        ret = lua.p_loadbufferx(L, overrideSrc.c_str(), overrideSrc.size(), name, mode);
+    } else {
+        ret = lua.p_loadbufferx(L, buff, sz, name, mode);
+    }
+
     lua.EnableHook();
     return ret;
 }
@@ -148,6 +185,7 @@ int MyLuaLoadString(lua_State* L, const char* s) {
     HookProcessHelper(lua, L);
 
     lua.DisableHook();
+
     int ret = lua.p_loadstring(L, s);
     lua.EnableHook();
     return ret;
@@ -195,57 +233,50 @@ void MyLuaSetTop(lua_State *L, int idx) {
 void LuaInterface::Initialize() {
     std::cout << "[Agent] Scanning for Lua..." << std::endl;
 
-    // 1. Try Common Names
-    const char* names[] = { "lua54.dll", "lua5.4.dll", "lua53.dll", "lua.dll", "xlua.dll" };
-    for (const char* name : names) {
-        m_hLua = GetModuleHandleA(name);
-        if (m_hLua) {
-            std::cout << "[Agent] Found Lua: " << name << std::endl;
-            break;
-        }
-    }
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    HANDLE hProcess = GetCurrentProcess();
 
-    // 2. Try Scanning All Modules
-    if (!m_hLua) {
-        std::cout << "[Agent] Scanning all modules..." << std::endl;
-        HMODULE hMods[1024];
-        DWORD cbNeeded;
-        HANDLE hProcess = GetCurrentProcess();
-        if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-            unsigned int numMods = cbNeeded / sizeof(HMODULE);
-            if (numMods > 1024) numMods = 1024;
-            for (unsigned int i = 0; i < numMods; i++) {
-                if (GetProcAddress(hMods[i], "lua_gettop")) {
-                     char modName[MAX_PATH];
-                     if (GetModuleBaseNameA(hProcess, hMods[i], modName, sizeof(modName))) {
-                         std::cout << "[Agent] Found Lua symbols in: " << modName << std::endl;
-                         m_hLua = hMods[i];
-                         break;
-                     }
+    // 1. Scan All Loaded Modules
+    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        unsigned int numMods = cbNeeded / sizeof(HMODULE);
+        if (numMods > 1024) numMods = 1024;
+
+        for (unsigned int i = 0; i < numMods; i++) {
+            // Check for basic export first to avoid overhead
+            if (GetProcAddress(hMods[i], "lua_gettop")) {
+                char modName[MAX_PATH];
+                GetModuleBaseNameA(hProcess, hMods[i], modName, sizeof(modName));
+                std::cout << "[Agent] Candidate found: " << modName << std::endl;
+
+                if (ResolveSymbols(hMods[i])) {
+                    m_hLua = hMods[i];
+                    std::cout << "[Agent] Hooked Lua in: " << modName << std::endl;
+                    return;
                 }
             }
         }
     }
 
-    // 3. Try Main Executable (Fallback)
-    if (!m_hLua) {
-        m_hLua = GetModuleHandle(NULL);
-        if (GetProcAddress(m_hLua, "lua_gettop")) {
-            std::cout << "[Agent] Found Lua symbols in Main Executable." << std::endl;
-        } else {
-            m_hLua = NULL;
+    // 2. Try Main Executable specifically (sometimes EnumProcessModules logic might vary?)
+    // Usually covered above, but safety net.
+    HMODULE hMain = GetModuleHandle(NULL);
+    if (hMain && GetProcAddress(hMain, "lua_gettop")) {
+        std::cout << "[Agent] Checking Main Executable..." << std::endl;
+        if (ResolveSymbols(hMain)) {
+            m_hLua = hMain;
+            std::cout << "[Agent] Hooked Lua in Main Executable." << std::endl;
+            return;
         }
     }
 
-    if (!m_hLua) {
-        std::cout << "[Agent] Failed to find Lua symbols." << std::endl;
-        return;
-    }
-
-    ResolveSymbols(m_hLua);
+    std::cout << "[Agent] Failed to find a usable Lua module." << std::endl;
 }
 
-void LuaInterface::ResolveSymbols(HMODULE hMod) {
+bool LuaInterface::ResolveSymbols(HMODULE hMod) {
+    // Reset pointers first
+    p_gettop = nullptr;
+
     p_gettop = (lua_gettop_t)GetProcAddress(hMod, "lua_gettop");
     p_settop = (lua_settop_t)GetProcAddress(hMod, "lua_settop");
     p_pushvalue = (lua_pushvalue_t)GetProcAddress(hMod, "lua_pushvalue");
@@ -257,6 +288,7 @@ void LuaInterface::ResolveSymbols(HMODULE hMod) {
     p_tonumber = (lua_tonumber_t)GetProcAddress(hMod, "lua_tonumber");
     p_toboolean = (lua_toboolean_t)GetProcAddress(hMod, "lua_toboolean");
     p_topointer = (lua_topointer_t)GetProcAddress(hMod, "lua_topointer");
+    p_getfield  = (lua_getfield_t)GetProcAddress(hMod, "lua_getfield");
 
     // Pcall variants
     p_pcallk = (lua_pcallk_t)GetProcAddress(hMod, "lua_pcallk");
@@ -290,8 +322,10 @@ void LuaInterface::ResolveSymbols(HMODULE hMod) {
         EnableHook();
         m_Loaded = true;
         std::cout << "[Agent] Hooks Installed: " << m_Hooks.size() << std::endl;
+        return true;
     } else {
-        std::cout << "[Agent] Failed to find ANY function to hook." << std::endl;
+        std::cout << "[Agent] No hooks found in this module." << std::endl;
+        return false;
     }
 }
 
@@ -377,6 +411,7 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
 
     // Initial Header
     out = "Globals Dump (Streaming):\n";
+    out.reserve(65536);
 
     p_getglobal(m_L, "_G");
     if (p_gettop(m_L) > 0) {
@@ -386,13 +421,14 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
         while (p_next(m_L, -2) != 0) {
             // Check Progress
             count++;
-            if (count % 50 == 0) {
+            if (count % 500 == 0) {
                 // Send Chunk if valid
                 if (!out.empty()) {
                     MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
                     DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
                     WriteFile(hPipe, out.data(), out.size(), &w, NULL);
                     out.clear();
+                    out.reserve(65536);
                 }
 
                 // Send Progress
@@ -402,8 +438,8 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
                 WriteFile(hPipe, prog.data(), prog.size(), &w, NULL);
             }
 
-            if (count > 5000) { // Limit items
-                out.append("... [Output Truncated > 5000] ...\n");
+            if (count > 20000) { // Limit items
+                out.append("... [Output Truncated > 20000] ...\n");
                 p_settop(m_L, -3);
                 break;
             }
@@ -497,13 +533,52 @@ void LuaInterface::ScanPlayers(HANDLE hPipe) {
         }
 
         out.append(key ? key : "[Unknown Key]");
-        out.append(" | Addr: ");
+        out.append("|");
 
         // Get Pointer
         const void* ptr = p_topointer ? p_topointer(m_L, -1) : nullptr;
         char addrBuf[32];
         sprintf_s(addrBuf, "%p", ptr);
         out.append(addrBuf);
+        out.append("|");
+
+        // Try to get Position
+        // Stack: Players, Key, Value(Player)
+        std::string posStr = "Unknown";
+        if (p_type(m_L, -1) == 5) { // If value is table
+             // Try 'Position'
+             p_getfield(m_L, -1, "Position");
+             if (p_type(m_L, -1) != 0) {
+                 // Found something, check if it has x,y,z
+             } else {
+                 p_settop(m_L, -2); // pop nil
+                 // Try 'pos'
+                 p_getfield(m_L, -1, "pos");
+             }
+
+             // Now top is Position object or nil
+             if (p_type(m_L, -1) == 5 || p_type(m_L, -1) == 7) { // Table or Userdata
+                 // Try x, y, z
+                 double x=0, y=0, z=0;
+                 p_getfield(m_L, -1, "x");
+                 if (p_tonumber) x = p_tonumber(m_L, -1);
+                 p_settop(m_L, -2);
+
+                 p_getfield(m_L, -1, "y");
+                 if (p_tonumber) y = p_tonumber(m_L, -1);
+                 p_settop(m_L, -2);
+
+                 p_getfield(m_L, -1, "z");
+                 if (p_tonumber) z = p_tonumber(m_L, -1);
+                 p_settop(m_L, -2);
+
+                 char buf[64];
+                 sprintf_s(buf, "%.1f, %.1f, %.1f", x, y, z);
+                 posStr = buf;
+             }
+             p_settop(m_L, -2); // pop Position/nil
+        }
+        out.append(posStr);
         out.append("\n");
 
         p_settop(m_L, -2); // pop value
@@ -527,6 +602,7 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
     int registry_index = -1001000;
 
     std::string out = "Registry Dump:\n";
+    out.reserve(65536);
 
     p_pushvalue(m_L, registry_index); // Push Registry
     if (p_type(m_L, -1) != 5) {
@@ -535,22 +611,55 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
         p_pushnil(m_L);
         int count = 0;
         while (p_next(m_L, -2) != 0) {
-            if (count++ > 1000) {
+            count++;
+            if (count % 500 == 0) {
+                // Send Chunk
+                if (!out.empty()) {
+                    MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+                    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+                    WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+                    out.clear();
+                    out.reserve(65536);
+                }
+
+                // Send Progress
+                std::string prog = "Dumped Registry " + std::to_string(count) + " items...";
+                MessageHeader h = { (uint32_t)prog.size(), RESP_PROGRESS };
+                DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+                WriteFile(hPipe, prog.data(), prog.size(), &w, NULL);
+            }
+
+            if (count > 20000) {
                 out.append("... Truncated ...\n");
                 p_settop(m_L, -3);
                 break;
             }
             // Key
             int kType = p_type(m_L, -2);
-            if (kType == 3) out.append(std::to_string((int)p_tonumber(m_L, -2)));
-            else if (kType == 4) out.append(p_tolstring(m_L, -2, NULL));
-            else out.append(p_typename(m_L, kType));
+            std::string keyStr;
+            if (kType == 3) keyStr = std::to_string((int)p_tonumber(m_L, -2));
+            else if (kType == 4) keyStr = p_tolstring(m_L, -2, NULL);
+            else keyStr = p_typename(m_L, kType);
 
-            out.append(" = ");
-
-            // Value
+            // Value Type
             int vType = p_type(m_L, -1);
-            out.append(p_typename(m_L, vType));
+            std::string typeStr = p_typename(m_L, vType);
+
+            // Value Preview
+            std::string valStr = typeStr;
+            if (vType == 3 && p_tonumber) valStr = std::to_string(p_tonumber(m_L, -1));
+            else if (vType == 1 && p_toboolean) valStr = p_toboolean(m_L, -1) ? "true" : "false";
+            else if (vType == 4 && p_tolstring) {
+                const char* s = p_tolstring(m_L, -1, NULL);
+                valStr = s ? s : "";
+                if (valStr.length() > 30) valStr = valStr.substr(0, 27) + "...";
+            }
+
+            out.append(keyStr);
+            out.append("|");
+            out.append(typeStr);
+            out.append("|");
+            out.append(valStr);
             out.append("\n");
 
             p_settop(m_L, -2);
@@ -576,26 +685,26 @@ void LuaInterface::DumpScripts(HANDLE hPipe) {
     if (!p_getglobal || !p_getinfo) return;
 
     std::string out = "Discovered Scripts (Functions in _G):\n";
+    out.reserve(65536);
 
     p_getglobal(m_L, "_G");
     p_pushnil(m_L);
     while (p_next(m_L, -2) != 0) {
         if (p_type(m_L, -1) == 6) { // LUA_TFUNCTION
              const char* key = p_tolstring(m_L, -2, NULL);
-             out.append("Function: ");
-             out.append(key ? key : "?");
+             std::string fnName = key ? key : "?";
 
-             // Get Info
-             // struct lua_Debug is large, let's allocate enough buffer
-             char debugBuf[256];
-             // We need to be careful with struct layout.
-             // Safer to not use getinfo if we don't have the struct definition.
-             // But we can try to push it on stack and check?
-             // Actually, `lua_getinfo` writes to a struct. Without correct struct layout matching the DLL version, this will CRASH.
-             // We cannot safely use lua_getinfo without the header definition matching the DLL.
-             // SKIPPING DETAILED INFO for safety.
+             out.append(fnName);
+             out.append("|");
 
-             out.append(" [Lua Function]\n");
+             // Use lua_getinfo to get source file if possible
+             // We need 'lua_Debug' struct definition to use lua_getinfo.
+             // Since we don't have it, we can't reliably get the source path safely without potential crash due to struct mismatch.
+             // However, generic Lua 5.4 lua_Debug is standard.
+             // Let's assume standard layout or skip it.
+             // For now, we return just the name and a placeholder.
+             out.append("[Script]");
+             out.append("\n");
         }
         p_settop(m_L, -2);
     }
@@ -604,6 +713,25 @@ void LuaInterface::DumpScripts(HANDLE hPipe) {
     MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
     DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
     WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+}
+
+void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
+    if (!m_L) return;
+
+    // We can't easily get source CODE without decompilation or if it was loaded from string/file and kept.
+    // We will try to find the function in _G and get 'source' from getinfo if we decide to implement struct.
+    // For now, we will return a message saying it's not fully supported or return the override if present.
+
+    std::string src = GetOverride(name);
+    if (src.empty()) {
+        src = "-- Source for " + name + "\n-- (Source retrieval requires debug symbols or decompiler, which is not implemented)\n-- You can set an Override for this script.";
+    } else {
+        src = "-- Override Found:\n" + src;
+    }
+
+    MessageHeader h = { (uint32_t)src.size(), RESP_DATA };
+    DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+    WriteFile(hPipe, src.data(), src.size(), &w, NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -676,6 +804,24 @@ bool LuaInterface::ProcessTasks() {
             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
         } else if (t.type == CMD_DUMP_SCRIPTS) {
             DumpScripts(t.pipe);
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_GET_SCRIPT_SOURCE) {
+            GetScriptSource(t.pipe, t.payload);
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_ADD_OVERRIDE) {
+            // Payload format: "Name\nSource"
+            size_t delim = t.payload.find('\n');
+            if (delim != std::string::npos) {
+                std::string name = t.payload.substr(0, delim);
+                std::string src = t.payload.substr(delim + 1);
+                AddOverride(name, src);
+            }
+            MessageHeader h = { 0, RESP_OK };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_RESET_OVERRIDES) {
+            ResetOverrides();
             MessageHeader h = { 0, RESP_OK };
             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
         }
