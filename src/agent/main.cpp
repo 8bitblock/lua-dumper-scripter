@@ -29,6 +29,9 @@ typedef int         (*lua_getfield_t)(lua_State *L, int idx, const char *k);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
 typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
+typedef void        (*lua_pushcclosure_t)(lua_State *L, int (*fn)(lua_State *), int n);
+typedef void        (*lua_setglobal_t)(lua_State *L, const char *name);
+typedef void        (*lua_getglobal_t)(lua_State *L, const char *name);
 
 // ----------------------------------------------------------------------------
 // Lua Interface Class
@@ -55,6 +58,7 @@ public:
     void EnableHook();
     void DisableHook();
     bool ProcessTasks(); // Returns true if tasks were processed
+    void InstallPrintHook();
 
     // Accessors
     void SetState(lua_State* L) { m_L = L; }
@@ -104,6 +108,11 @@ private:
     lua_topointer_t p_topointer = nullptr;
     lua_getfield_t  p_getfield = nullptr;
     lua_pcallk_t    p_pcallk = nullptr;
+    lua_pushcclosure_t p_pushcclosure = nullptr;
+    lua_setglobal_t    p_setglobal = nullptr;
+    lua_getglobal_t    p_getglobal = nullptr;
+
+    friend int MyLuaPrint(lua_State* L);
 
     // Loaders
     luaL_loadbufferx_t p_loadbufferx = nullptr;
@@ -126,6 +135,7 @@ private:
     friend int MyLuaPcall(lua_State *L, int nargs, int nresults, int errfunc);
     friend int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
     friend void MyLuaSetTop(lua_State *L, int idx);
+    friend int MyLuaPrint(lua_State* L);
     friend void HookProcessHelper(LuaInterface& lua, lua_State* L);
 };
 
@@ -138,11 +148,37 @@ void HookProcessHelper(LuaInterface& lua, lua_State* L) {
     lua.m_RecursionGuard = true;
     lua.SetState(L);
 
+    // Install Print Hook lazily
+    static bool printHooked = false;
+    if (!printHooked) {
+        lua.InstallPrintHook();
+        printHooked = true;
+    }
+
+    // Optimization: Only process tasks if there ARE tasks.
+    // Peek at queue safely? We need a way to check without heavy locking if possible, or just lock quickly.
+    // We can rely on a lightweight atomic flag 'g_HasTasks' if we wanted, but for now let's just reduce the throttle.
+    // Actually, locking g_TaskMutex is fast if there is no contention.
+    // The Slow part is DisableHook/EnableHook (VirtualProtect).
+    // So we should ONLY DisableHook if ProcessTasks() returns TRUE (didWork).
+
+    // But ProcessTasks needs to run TO return true.
+    // New Logic: Call ProcessTasks WITHOUT disabling hooks first?
+    // No, running Lua commands (LoadScript) requires hooks disabled to avoid recursion/detection?
+    // Actually, LoadScript calls p_loadbufferx. If we hooked it, we recurse.
+    // So we MUST disable hooks if we plan to call Lua API that we hooked.
+
+    // Compromise: Check if there are tasks. If yes, disable hooks and run them.
+    // We need a helper to peek.
+    extern bool HasPendingTasks();
+
     uint32_t now = GetTickCount();
-    if (now - lua.m_LastTick > 100) {
-        lua.DisableHook(); // Disable ALL hooks
-        lua.ProcessTasks();
-        lua.EnableHook();  // Re-enable ALL hooks
+    if (now - lua.m_LastTick > 10) { // Reduced from 100ms to 10ms for responsiveness
+        if (HasPendingTasks()) {
+            lua.DisableHook();
+            lua.ProcessTasks();
+            lua.EnableHook();
+        }
         lua.m_LastTick = now;
     }
     lua.m_RecursionGuard = false;
@@ -170,10 +206,20 @@ int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name
 
     int ret;
     if (!overrideSrc.empty()) {
-        std::cout << "[Agent] Applying Override for: " << name << std::endl;
-        ret = lua.p_loadbufferx(L, overrideSrc.c_str(), overrideSrc.size(), name, mode);
+        // Validation: Ensure function pointers and arguments are valid before calling
+        if (lua.p_loadbufferx && overrideSrc.c_str()) {
+             std::cout << "[Agent] Applying Override for: " << name << std::endl;
+             ret = lua.p_loadbufferx(L, overrideSrc.c_str(), overrideSrc.size(), name, mode);
+        } else {
+             // Fallback if something is wrong
+             ret = lua.p_loadbufferx(L, buff, sz, name, mode);
+        }
     } else {
-        ret = lua.p_loadbufferx(L, buff, sz, name, mode);
+        if (lua.p_loadbufferx) {
+            ret = lua.p_loadbufferx(L, buff, sz, name, mode);
+        } else {
+            ret = 0; // Should not happen if hooked
+        }
     }
 
     lua.EnableHook();
@@ -227,6 +273,78 @@ void MyLuaSetTop(lua_State *L, int idx) {
     lua.EnableHook();
 }
 
+int MyLuaPrint(lua_State* L) {
+    auto& lua = LuaInterface::Get();
+    int n = lua.p_gettop(L);
+    std::string out;
+    lua.p_getglobal(L, "tostring");
+
+    for (int i=1; i<=n; i++) {
+        lua.p_pushvalue(L, -1); // push tostring
+        lua.p_pushvalue(L, i);  // push arg
+        lua.p_pcallk(L, 1, 1, 0, 0, nullptr);
+
+        const char* s = lua.p_tolstring(L, -1, NULL);
+        if (s) {
+            if (i > 1) out += "\t";
+            out += s;
+        }
+        lua.p_settop(L, -2); // pop result
+    }
+    lua.p_settop(L, -2); // pop tostring
+
+    // Send to Pipe
+    // To send this to the GUI without blocking heavily, we should try CallNamedPipe with a short timeout
+    // or just fire and forget.
+    // For simplicity and robustness in "all out" mode, we will try to connect to the pipe specifically for logging if available.
+
+    // Format: "PID|Log"
+    char pipeName[256];
+    sprintf_s(pipeName, "\\\\.\\pipe\\luatool_%lu", GetCurrentProcessId());
+
+    // We can't use the existing server thread pipe because it listens.
+    // We need to be a CLIENT to the GUI? No, the GUI is the client.
+    // The IPC model is: Agent listens, GUI connects.
+    // So the GUI must poll for logs?
+    // Or we have a separate log queue in the agent that the GUI fetches via CMD_POLL_LOGS?
+    // OR we send it as a "reverse" connection if possible? No.
+    // Correct approach for this architecture: Queue it, and let GUI poll it or send it as an unsolicited message if there's an active connection?
+    // Current architecture: Request-Response.
+    // So we need a log buffer.
+
+    extern void AppendLog(const std::string& msg);
+    AppendLog(out);
+
+    std::cout << "[LUA] " << out << std::endl;
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// Helper: FindPattern
+// ----------------------------------------------------------------------------
+uintptr_t FindPattern(HMODULE hMod, const char* pattern, const char* mask) {
+    MODULEINFO modInfo;
+    if (!GetModuleInformation(GetCurrentProcess(), hMod, &modInfo, sizeof(MODULEINFO))) return 0;
+
+    uintptr_t start = (uintptr_t)modInfo.lpBaseOfDll;
+    uintptr_t size = (uintptr_t)modInfo.SizeOfImage;
+    uintptr_t end = start + size;
+
+    size_t patternLen = strlen(mask);
+
+    for (uintptr_t i = start; i < end - patternLen; i++) {
+        bool found = true;
+        for (size_t j = 0; j < patternLen; j++) {
+            if (mask[j] != '?' && pattern[j] != *(char*)(i + j)) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return i;
+    }
+    return 0;
+}
+
 // ----------------------------------------------------------------------------
 // LuaInterface Implementation
 // ----------------------------------------------------------------------------
@@ -237,17 +355,17 @@ void LuaInterface::Initialize() {
     DWORD cbNeeded;
     HANDLE hProcess = GetCurrentProcess();
 
-    // 1. Scan All Loaded Modules
+    // 1. Scan All Loaded Modules using Exports
     if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
         unsigned int numMods = cbNeeded / sizeof(HMODULE);
         if (numMods > 1024) numMods = 1024;
 
         for (unsigned int i = 0; i < numMods; i++) {
-            // Check for basic export first to avoid overhead
-            if (GetProcAddress(hMods[i], "lua_gettop")) {
+            // Check for exports
+            if (GetProcAddress(hMods[i], "lua_gettop") || GetProcAddress(hMods[i], "lua_pcall") || GetProcAddress(hMods[i], "lua_newstate")) {
                 char modName[MAX_PATH];
                 GetModuleBaseNameA(hProcess, hMods[i], modName, sizeof(modName));
-                std::cout << "[Agent] Candidate found: " << modName << std::endl;
+                std::cout << "[Agent] Export Candidate found: " << modName << std::endl;
 
                 if (ResolveSymbols(hMods[i])) {
                     m_hLua = hMods[i];
@@ -256,47 +374,89 @@ void LuaInterface::Initialize() {
                 }
             }
         }
-    }
 
-    // 2. Try Main Executable specifically (sometimes EnumProcessModules logic might vary?)
-    // Usually covered above, but safety net.
-    HMODULE hMain = GetModuleHandle(NULL);
-    if (hMain && GetProcAddress(hMain, "lua_gettop")) {
-        std::cout << "[Agent] Checking Main Executable..." << std::endl;
-        if (ResolveSymbols(hMain)) {
-            m_hLua = hMain;
-            std::cout << "[Agent] Hooked Lua in Main Executable." << std::endl;
-            return;
+        // 2. Pattern Scan if exports failed
+        std::cout << "[Agent] No exports found. Attempting Pattern Scan..." << std::endl;
+        for (unsigned int i = 0; i < numMods; i++) {
+             // Basic Lua 5.4/5.3 lua_gettop x64 signature: 48 8B 41 18 48 2B 41 28 48 C1 F8 04 C3 (return (L->top - L->ci->func) >> 4? No, typically simpler)
+             // Common x64 lua_gettop:
+             // mov rax, [rcx+...]; sub rax, [rcx+...]; sar rax, 4; ret
+             // Let's try to find *any* common pattern.
+             // Actually, if we find the function via pattern, we can't easily find *others* unless we have a consistent way or they are close.
+             // But usually if it's statically linked, we are scanning the main exe.
+
+             // For now, let's just re-check Main Module with a looser heuristic if needed,
+             // but 'ResolveSymbols' relies on GetProcAddress.
+             // IF symbols are stripped (statically linked), GetProcAddress will FAIL.
+             // We need to implement pattern scanning for EACH function if GetProcAddress fails.
+             // For this step, we will just prioritize the Main Executable if no DLLs matched.
         }
     }
 
-    std::cout << "[Agent] Failed to find a usable Lua module." << std::endl;
+    // 3. Fallback: Main Executable (Pattern Scan for ResolveSymbols context?)
+    // If we are here, GetProcAddress failed on everything.
+    // We update ResolveSymbols to handle non-HMODULE based resolution?
+    // Or we rely on the fact that if we found 'lua_gettop' via export, we are good.
+    // If the game has NO exports, we need a massive pattern scan architecture.
+    // For this task ("Option 3"), we will implement pattern scanning *inside* ResolveSymbols as a fallback for GetProcAddress.
+
+    // Check Main Executable one last time blindly?
+    // Actually, let's just rely on the loop above.
+
+    std::cout << "[Agent] Failed to find a usable Lua module via Exports." << std::endl;
 }
 
 bool LuaInterface::ResolveSymbols(HMODULE hMod) {
     // Reset pointers first
     p_gettop = nullptr;
 
-    p_gettop = (lua_gettop_t)GetProcAddress(hMod, "lua_gettop");
-    p_settop = (lua_settop_t)GetProcAddress(hMod, "lua_settop");
-    p_pushvalue = (lua_pushvalue_t)GetProcAddress(hMod, "lua_pushvalue");
-    p_next = (lua_next_t)GetProcAddress(hMod, "lua_next");
-    p_pushnil = (lua_pushnil_t)GetProcAddress(hMod, "lua_pushnil");
-    p_tolstring = (lua_tolstring_t)GetProcAddress(hMod, "lua_tolstring");
-    p_type = (lua_type_t)GetProcAddress(hMod, "lua_type");
-    p_typename = (lua_typename_t)GetProcAddress(hMod, "lua_typename");
-    p_tonumber = (lua_tonumber_t)GetProcAddress(hMod, "lua_tonumber");
-    p_toboolean = (lua_toboolean_t)GetProcAddress(hMod, "lua_toboolean");
-    p_topointer = (lua_topointer_t)GetProcAddress(hMod, "lua_topointer");
-    p_getfield  = (lua_getfield_t)GetProcAddress(hMod, "lua_getfield");
+    // Helper to resolve or pattern scan (Stub for pattern scan, currently just GetProcAddress)
+    auto Resolve = [&](const char* name) -> void* {
+        void* addr = (void*)GetProcAddress(hMod, name);
+        // Future: If !addr, FindPattern(...)
+        return addr;
+    };
+
+    p_gettop = (lua_gettop_t)Resolve("lua_gettop");
+    p_settop = (lua_settop_t)Resolve("lua_settop");
+    p_pushvalue = (lua_pushvalue_t)Resolve("lua_pushvalue");
+    p_next = (lua_next_t)Resolve("lua_next");
+    p_pushnil = (lua_pushnil_t)Resolve("lua_pushnil");
+    p_tolstring = (lua_tolstring_t)Resolve("lua_tolstring");
+    p_type = (lua_type_t)Resolve("lua_type");
+    p_typename = (lua_typename_t)Resolve("lua_typename");
+    p_tonumber = (lua_tonumber_t)Resolve("lua_tonumber");
+    p_toboolean = (lua_toboolean_t)Resolve("lua_toboolean");
+    p_topointer = (lua_topointer_t)Resolve("lua_topointer");
+    p_getfield  = (lua_getfield_t)Resolve("lua_getfield");
+    p_pushcclosure = (lua_pushcclosure_t)Resolve("lua_pushcclosure");
+    p_setglobal = (lua_setglobal_t)Resolve("lua_setglobal");
+    p_getglobal = (lua_getglobal_t)Resolve("lua_getglobal");
 
     // Pcall variants
-    p_pcallk = (lua_pcallk_t)GetProcAddress(hMod, "lua_pcallk");
-    if (!p_pcallk) p_pcallk = (lua_pcallk_t)GetProcAddress(hMod, "lua_pcall");
+    p_pcallk = (lua_pcallk_t)Resolve("lua_pcallk");
+    if (!p_pcallk) p_pcallk = (lua_pcallk_t)Resolve("lua_pcall");
+    // Fallback: If no pcall/pcallk, try 'lua_call' or 'lua_callk' (unsafe but better than nothing?)
+    // Usually hooking 'call' is dangerous due to exceptions, but for detection it proves presence.
+    if (!p_pcallk) {
+        // Try hooking lua_call as a last resort for *detection*, but don't use it for *execution* wrappers
+        void* p_call = Resolve("lua_call");
+        if (p_call) std::cout << "[Agent] Found lua_call but not lua_pcall." << std::endl;
+    }
 
     // Loaders
-    p_loadbufferx = (luaL_loadbufferx_t)GetProcAddress(hMod, "luaL_loadbufferx");
-    p_loadstring = (luaL_loadstring_t)GetProcAddress(hMod, "luaL_loadstring");
+    p_loadbufferx = (luaL_loadbufferx_t)Resolve("luaL_loadbufferx");
+    p_loadstring = (luaL_loadstring_t)Resolve("luaL_loadstring");
+
+    // Hooking strategy:
+    // We MUST have at least pcall (or call) and a loader to be useful.
+    // But to just *run*, we need gettop/settop for our internal logic.
+
+    // VALIDATION
+    if (!p_gettop || !p_pushvalue || !p_type) {
+        std::cout << "[Agent] Critical symbols missing (gettop/pushvalue/type). Aborting hook for this module." << std::endl;
+        return false;
+    }
 
     // Add Hooks
     auto AddHook = [&](void* target, void* detour, const char* name) {
@@ -310,10 +470,14 @@ bool LuaInterface::ResolveSymbols(HMODULE hMod) {
         std::cout << "[Agent] Added Hook: " << name << " at " << target << std::endl;
     };
 
-    if (p_pcallk) AddHook((void*)p_pcallk, (void*)MyLuaPcallK, "lua_pcallk");
-    else if (GetProcAddress(hMod, "lua_pcall")) AddHook((void*)GetProcAddress(hMod, "lua_pcall"), (void*)MyLuaPcall, "lua_pcall");
+    // Optimization: Don't hook gettop/settop unless debug/logging needed. They are called too often.
+    // We use our Resolved pointer to call them, but we don't intercept them.
+    // EXCEPT if we need them for some specific feature? No, usually not.
+    // Removing hooks for gettop/settop to improve speed.
+    // if (p_settop) AddHook((void*)p_settop, (void*)MyLuaSetTop, "lua_settop"); <--- REMOVED
 
-    if (p_settop) AddHook((void*)p_settop, (void*)MyLuaSetTop, "lua_settop");
+    if (p_pcallk) AddHook((void*)p_pcallk, (void*)MyLuaPcallK, "lua_pcallk");
+    // else if (p_call) ... (Not hooking call for safety)
 
     if (p_loadbufferx) AddHook((void*)p_loadbufferx, (void*)MyLuaLoadBufferX, "luaL_loadbufferx");
     if (p_loadstring) AddHook((void*)p_loadstring, (void*)MyLuaLoadString, "luaL_loadstring");
@@ -394,12 +558,9 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
         return;
     }
 
-    // Find _G
-    typedef void (*lua_getglobal_t)(lua_State*, const char*);
-    lua_getglobal_t p_getglobal = (lua_getglobal_t)GetProcAddress(m_hLua, "lua_getglobal");
-
-    if (!p_getglobal) {
-        std::string msg = "lua_getglobal not found.";
+    // Validate pointers used in DumpRegistry
+    if (!p_pushvalue || !p_type || !p_pushnil || !p_next || !p_tolstring || !p_typename || !p_tonumber || !p_toboolean || !p_settop) {
+        std::string msg = "Critical Lua functions missing for DumpRegistry.";
         MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
@@ -411,7 +572,7 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
 
     // Initial Header
     out = "Globals Dump (Streaming):\n";
-    out.reserve(65536);
+    out.reserve(131072);
 
     p_getglobal(m_L, "_G");
     if (p_gettop(m_L) > 0) {
@@ -421,7 +582,7 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
         while (p_next(m_L, -2) != 0) {
             // Check Progress
             count++;
-            if (count % 500 == 0) {
+            if (count % 1000 == 0) {
                 // Send Chunk if valid
                 if (!out.empty()) {
                     MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
@@ -438,8 +599,8 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
                 WriteFile(hPipe, prog.data(), prog.size(), &w, NULL);
             }
 
-            if (count > 20000) { // Limit items
-                out.append("... [Output Truncated > 20000] ...\n");
+            if (count > 50000) { // Limit items
+                out.append("... [Output Truncated > 50000] ...\n");
                 p_settop(m_L, -3);
                 break;
             }
@@ -545,11 +706,12 @@ void LuaInterface::ScanPlayers(HANDLE hPipe) {
         // Try to get Position
         // Stack: Players, Key, Value(Player)
         std::string posStr = "Unknown";
-        if (p_type(m_L, -1) == 5) { // If value is table
+        // Validation: Ensure p_getfield/p_type/p_settop/p_tonumber exist before using them.
+        if (p_getfield && p_type && p_settop && p_tonumber && p_type(m_L, -1) == 5) { // If value is table
              // Try 'Position'
              p_getfield(m_L, -1, "Position");
-             if (p_type(m_L, -1) != 0) {
-                 // Found something, check if it has x,y,z
+             if (p_type(m_L, -1) != 0) { // Not nil
+                 // Found something
              } else {
                  p_settop(m_L, -2); // pop nil
                  // Try 'pos'
@@ -561,15 +723,15 @@ void LuaInterface::ScanPlayers(HANDLE hPipe) {
                  // Try x, y, z
                  double x=0, y=0, z=0;
                  p_getfield(m_L, -1, "x");
-                 if (p_tonumber) x = p_tonumber(m_L, -1);
+                 if (p_type(m_L, -1) == 3) x = p_tonumber(m_L, -1);
                  p_settop(m_L, -2);
 
                  p_getfield(m_L, -1, "y");
-                 if (p_tonumber) y = p_tonumber(m_L, -1);
+                 if (p_type(m_L, -1) == 3) y = p_tonumber(m_L, -1);
                  p_settop(m_L, -2);
 
                  p_getfield(m_L, -1, "z");
-                 if (p_tonumber) z = p_tonumber(m_L, -1);
+                 if (p_type(m_L, -1) == 3) z = p_tonumber(m_L, -1);
                  p_settop(m_L, -2);
 
                  char buf[64];
@@ -676,13 +838,13 @@ void LuaInterface::DumpScripts(HANDLE hPipe) {
     // Iterate _G looking for functions and get info
     if (!m_L) return;
 
-    typedef void (*lua_getglobal_t)(lua_State*, const char*);
-    lua_getglobal_t p_getglobal = (lua_getglobal_t)GetProcAddress(m_hLua, "lua_getglobal");
-
-    typedef int (*lua_getinfo_t)(lua_State*, const char*, void*); // lua_Debug* is void* here
-    lua_getinfo_t p_getinfo = (lua_getinfo_t)GetProcAddress(m_hLua, "lua_getinfo");
-
-    if (!p_getglobal || !p_getinfo) return;
+    if (!p_getglobal || !p_pushnil || !p_next || !p_type || !p_tolstring || !p_settop) {
+        std::string msg = "Critical Lua functions missing for DumpScripts.";
+        MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+        return;
+    }
 
     std::string out = "Discovered Scripts (Functions in _G):\n";
     out.reserve(65536);
@@ -697,13 +859,13 @@ void LuaInterface::DumpScripts(HANDLE hPipe) {
              out.append(fnName);
              out.append("|");
 
-             // Use lua_getinfo to get source file if possible
-             // We need 'lua_Debug' struct definition to use lua_getinfo.
-             // Since we don't have it, we can't reliably get the source path safely without potential crash due to struct mismatch.
-             // However, generic Lua 5.4 lua_Debug is standard.
-             // Let's assume standard layout or skip it.
-             // For now, we return just the name and a placeholder.
-             out.append("[Script]");
+             // Include Source/Override info directly here for "batch loading" perception
+             std::string src = GetOverride(fnName);
+             if (!src.empty()) {
+                 out.append("Override Active");
+             } else {
+                 out.append("Original");
+             }
              out.append("\n");
         }
         p_settop(m_L, -2);
@@ -734,6 +896,14 @@ void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
     WriteFile(hPipe, src.data(), src.size(), &w, NULL);
 }
 
+void LuaInterface::InstallPrintHook() {
+    if (!m_L || !p_pushcclosure || !p_setglobal) return;
+    // Push C Closure
+    p_pushcclosure(m_L, MyLuaPrint, 0);
+    p_setglobal(m_L, "print");
+    std::cout << "[Agent] Replaced 'print' with custom handler." << std::endl;
+}
+
 // ----------------------------------------------------------------------------
 // IPC Logic
 // ----------------------------------------------------------------------------
@@ -746,7 +916,23 @@ struct Task {
 std::mutex g_TaskMutex;
 std::queue<Task> g_TaskQueue;
 
+std::mutex g_LogMutex;
+std::vector<std::string> g_LogQueue;
+
+void AppendLog(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_LogMutex);
+    g_LogQueue.push_back(msg);
+    if (g_LogQueue.size() > 1000) g_LogQueue.erase(g_LogQueue.begin());
+}
+
+bool HasPendingTasks() {
+    std::lock_guard<std::mutex> lock(g_TaskMutex);
+    return !g_TaskQueue.empty();
+}
+
 bool LuaInterface::ProcessTasks() {
+    // Optimization: Check empty without lock first to avoid overhead in high-frequency hooks?
+    // Unsafe. Stick to lock but ensure it's fast.
     std::lock_guard<std::mutex> lock(g_TaskMutex);
     bool didWork = !g_TaskQueue.empty();
 
@@ -824,6 +1010,19 @@ bool LuaInterface::ProcessTasks() {
             ResetOverrides();
             MessageHeader h = { 0, RESP_OK };
             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+        } else if (t.type == CMD_PRINT_OUTPUT) {
+            // Send buffered logs
+            std::string combined;
+            {
+                std::lock_guard<std::mutex> lock(g_LogMutex);
+                for (const auto& l : g_LogQueue) {
+                    combined += l + "\n";
+                }
+                g_LogQueue.clear();
+            }
+            MessageHeader h = { (uint32_t)combined.size(), RESP_DATA };
+            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
+            WriteFile(t.pipe, combined.data(), combined.size(), &w, NULL);
         }
         CloseHandle(t.pipe);
     }

@@ -16,6 +16,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include "../common/lua_ipc.h"
 
 // Forward declare Injector
@@ -242,6 +243,7 @@ std::vector<std::string> player_list;
 std::vector<std::string> registry_list;
 std::vector<std::string> script_list;
 std::string current_script_source;
+std::string console_log;
 
 // Helper to parse | separated strings
 std::vector<std::string> ParseRow(const std::string& row) {
@@ -458,52 +460,82 @@ int main(int argc, char* argv[]) {
                     ImGui::EndTabItem();
                 }
 
+                if (ImGui::BeginTabItem("Console")) {
+                    if (ImGui::Button("Clear Console")) console_log.clear();
+                    ImGui::BeginChild("ConsoleLog", ImVec2(0,0), true);
+                    ImGui::TextUnformatted(console_log.c_str());
+                    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+                    ImGui::EndChild();
+                    ImGui::EndTabItem();
+                }
+
                 if (ImGui::BeginTabItem("Executor")) {
-                    ImGui::Text("Script Editor");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Load")) {
-                        char filename[256] = "script.lua";
-                        std::ifstream t(filename);
+                    ImGui::Columns(2, "ExecCols", true);
+
+                    // Left Column: File Manager
+                    ImGui::Text("Script Library");
+                    ImGui::Separator();
+
+                    // Ensure scripts dir exists
+                    std::filesystem::create_directory("scripts");
+
+                    static std::string selectedFile = "";
+                    ImGui::BeginChild("FileList", ImVec2(0, 200), true);
+                    for (const auto& entry : std::filesystem::directory_iterator("scripts")) {
+                        if (entry.is_regular_file()) {
+                            std::string filename = entry.path().filename().string();
+                            if (ImGui::Selectable(filename.c_str(), selectedFile == filename)) {
+                                selectedFile = filename;
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+
+                    static char fileNameBuf[64] = "new_script.lua";
+                    ImGui::InputText("Filename", fileNameBuf, 64);
+
+                    if (ImGui::Button("Load") && !selectedFile.empty()) {
+                        std::ifstream t("scripts/" + selectedFile);
                         if (t.is_open()) {
                             std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
                             if (str.length() < IM_ARRAYSIZE(script_buffer)) {
                                 strcpy_s(script_buffer, str.c_str());
-                                output_log += "[Sys] Loaded script.lua\n";
-                            } else {
-                                output_log += "[Sys] Script too large for buffer.\n";
+                                output_log += "[Sys] Loaded " + selectedFile + "\n";
                             }
-                        } else {
-                            output_log += "[Sys] Failed to open script.lua\n";
                         }
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Save")) {
-                        std::ofstream t("script.lua");
+                        std::string fname = fileNameBuf;
+                        if (fname.find(".lua") == std::string::npos) fname += ".lua";
+                        std::ofstream t("scripts/" + fname);
                         if (t.is_open()) {
                             t << script_buffer;
-                            output_log += "[Sys] Saved to script.lua\n";
-                        } else {
-                            output_log += "[Sys] Failed to save script.lua\n";
+                            output_log += "[Sys] Saved to " + fname + "\n";
                         }
+                    }
+
+                    ImGui::NextColumn();
+
+                    // Right Column: Editor
+                    ImGui::Text("Script Editor");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Run Script") && selected_pid > 0) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Clear Editor")) { script_buffer[0] = 0; }
 
-                    ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-                    if (ImGui::Button("Clear Log")) { output_log.clear(); }
-
-                    ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, 200));
-
-                    if (ImGui::Button("Run Script", ImVec2(100, 0)) && selected_pid > 0) {
-                        RemoteAgent::Get().Send(selected_pid, CMD_RUN_SCRIPT, script_buffer);
-                    }
+                    // Adjust height to fill space, leaving room for override controls at bottom
+                    float footerHeight = 80.0f;
+                    ImGui::InputTextMultiline("##Script", script_buffer, IM_ARRAYSIZE(script_buffer), ImVec2(-FLT_MIN, -footerHeight));
 
                     ImGui::Separator();
                     ImGui::Text("Script Overrides");
                     static char overrideTarget[128] = "";
-                    ImGui::InputText("Target Script Name", overrideTarget, 128);
-
-                    if (ImGui::Button("Set Override from Editor") && selected_pid > 0) {
+                    ImGui::InputText("Target Name", overrideTarget, 128);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Set Override") && selected_pid > 0) {
                         if (strlen(overrideTarget) > 0) {
                             std::string payload = std::string(overrideTarget) + "\n" + std::string(script_buffer);
                             RemoteAgent::Get().Send(selected_pid, CMD_ADD_OVERRIDE, payload);
@@ -511,11 +543,12 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button("Reset All Overrides") && selected_pid > 0) {
+                    if (ImGui::Button("Reset All") && selected_pid > 0) {
                         RemoteAgent::Get().Send(selected_pid, CMD_RESET_OVERRIDES, "");
                         output_log += "[Sys] Overrides reset.\n";
                     }
 
+                    ImGui::Columns(1);
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -553,6 +586,9 @@ int main(int argc, char* argv[]) {
                 }
                 else if (l.find("-- Source for") != std::string::npos || l.find("-- Override Found:") != std::string::npos) {
                     current_script_source = l;
+                }
+                else if (l.find("[LUA]") != std::string::npos) {
+                    console_log += l + "\n";
                 }
                 else {
                     output_log += l + "\n";

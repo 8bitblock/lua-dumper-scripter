@@ -16,7 +16,8 @@ enum MessageType : uint8_t {
     RESP_OK = 10,
     RESP_ERROR = 11,
     RESP_DATA = 12,
-    RESP_PROGRESS = 13
+    RESP_PROGRESS = 13,
+    CMD_PRINT_OUTPUT = 14
 };
 
 struct MessageHeader {
