@@ -27,6 +27,8 @@ typedef double      (*lua_tonumber_t)(lua_State *L, int idx);
 typedef int         (*lua_toboolean_t)(lua_State *L, int idx);
 typedef const void* (*lua_topointer_t)(lua_State *L, int idx);
 typedef int         (*lua_getfield_t)(lua_State *L, int idx, const char *k);
+typedef int         (*lua_rawgeti_t)(lua_State *L, int idx, long long n);
+typedef int         (*lua_iscfunction_t)(lua_State *L, int idx);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
 typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
@@ -75,6 +77,7 @@ public:
     void DumpGlobals(HANDLE hPipe);
     void ScanPlayers(HANDLE hPipe);
     void DumpRegistry(HANDLE hPipe);
+    void InspectRegistryItem(HANDLE hPipe, const std::string& keyStr);
     void DumpScripts(HANDLE hPipe);
     void GetScriptSource(HANDLE hPipe, const std::string& name);
 
@@ -131,6 +134,8 @@ private:
     lua_toboolean_t p_toboolean = nullptr;
     lua_topointer_t p_topointer = nullptr;
     lua_getfield_t  p_getfield = nullptr;
+    lua_rawgeti_t   p_rawgeti = nullptr;
+    lua_iscfunction_t p_iscfunction = nullptr;
     lua_pcallk_t    p_pcallk = nullptr;
     lua_callk_t     p_callk = nullptr;
     lua_pushcclosure_t p_pushcclosure = nullptr;
@@ -405,6 +410,8 @@ bool LuaInterface::ResolveSymbols(HMODULE hMod) {
     p_toboolean = (lua_toboolean_t)Resolve("lua_toboolean");
     p_topointer = (lua_topointer_t)Resolve("lua_topointer");
     p_getfield  = (lua_getfield_t)Resolve("lua_getfield");
+    p_rawgeti   = (lua_rawgeti_t)Resolve("lua_rawgeti");
+    p_iscfunction = (lua_iscfunction_t)Resolve("lua_iscfunction");
     p_pushcclosure = (lua_pushcclosure_t)Resolve("lua_pushcclosure");
     p_setglobal = (lua_setglobal_t)Resolve("lua_setglobal");
     p_getglobal = (lua_getglobal_t)Resolve("lua_getglobal");
@@ -653,6 +660,12 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
                     if (valStr.length() > 30) valStr = valStr.substr(0, 27) + "...";
                     out.append(valStr);
                 }
+                else if ((vType == 5 || vType == 6 || vType == 8) && p_topointer) {
+                    // Table, Function, Thread - Append Address
+                    const void* ptr = p_topointer(m_L, -1);
+                    char buf[32]; sprintf_s(buf, "0x%p", ptr);
+                    out.append(buf);
+                }
                 out.append("\n");
                 p_settop(m_L, -2);
             }
@@ -665,9 +678,129 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
     });
 }
 
+void LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) {
+    SafeInvoke([&]() {
+        if (!m_L) {
+            std::string msg = "Lua State not ready.";
+            MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+            WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+            return;
+        }
+        if (!p_pushvalue || !p_type || !p_pushnil || !p_next || !p_tolstring || !p_typename || !p_settop) {
+            std::string msg = "Critical Lua functions missing.";
+            MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+            WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+            return;
+        }
+
+        std::string out = "Inspection Results for: " + keyStr + "\n";
+        out.reserve(65536);
+
+        // Push Registry
+        p_pushvalue(m_L, -1001000); // LUA_REGISTRYINDEX
+
+        // Try to find the item
+        bool found = false;
+        if (p_getfield) {
+            p_getfield(m_L, -1, keyStr.c_str());
+            if (p_type(m_L, -1) != 0) { // Not nil
+                found = true;
+            } else {
+                p_settop(m_L, -2); // Pop nil
+            }
+        }
+
+        if (!found && p_rawgeti) {
+            try {
+                long long idx = std::stoll(keyStr);
+                p_rawgeti(m_L, -1, idx);
+                if (p_type(m_L, -1) != 0) {
+                    found = true;
+                } else {
+                    p_settop(m_L, -2); // Pop nil
+                }
+            } catch (...) {}
+        }
+
+        if (!found) {
+            out += "Item not found in Registry.";
+            p_settop(m_L, -2); // Pop Registry
+        } else {
+            // Item is at top of stack (-1), Registry is at (-2)
+            int targetType = p_type(m_L, -1);
+            out += "Type: " + std::string(p_typename(m_L, targetType)) + "\n";
+
+            if (targetType == 5) { // Table
+                out += "Table Content:\n";
+                p_pushnil(m_L);
+                int count = 0;
+                while (p_next(m_L, -2) != 0) {
+                    count++;
+                    if (count % 500 == 0) {
+                         if (!out.empty()) {
+                            MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+                            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+                            WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+                            out.clear();
+                            out.reserve(65536);
+                        }
+                    }
+                    if (count > 10000) { out.append("... Truncated ...\n"); p_settop(m_L, -3); break; }
+
+                    // Key
+                    int kType = p_type(m_L, -2);
+                    if (kType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.0f", p_tonumber(m_L, -2)); out.append(buf); }
+                    else if (kType == 4) { const char* s = p_tolstring(m_L, -2, NULL); if(s) out.append(s); }
+                    else out.append(p_typename(m_L, kType));
+                    out.append("|");
+
+                    // Value Type
+                    int vType = p_type(m_L, -1);
+                    out.append(p_typename(m_L, vType));
+                    out.append("|");
+
+                    // Value
+                    if (vType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.14g", p_tonumber(m_L, -1)); out.append(buf); }
+                    else if (vType == 1 && p_toboolean) out.append(p_toboolean(m_L, -1) ? "true" : "false");
+                    else if (vType == 4 && p_tolstring) {
+                        const char* s = p_tolstring(m_L, -1, NULL);
+                        std::string valStr = s ? s : "";
+                        if (valStr.length() > 30) valStr = valStr.substr(0, 27) + "...";
+                        out.append(valStr);
+                    }
+                    else if ((vType == 5 || vType == 6 || vType == 8) && p_topointer) {
+                        const void* ptr = p_topointer(m_L, -1);
+                        char buf[32]; sprintf_s(buf, "0x%p", ptr);
+                        out.append(buf);
+                    }
+
+                    out.append("\n");
+                    p_settop(m_L, -2);
+                }
+            } else {
+                out += "Value is not a table.";
+            }
+            p_settop(m_L, -2); // Pop item
+            p_settop(m_L, -2); // Pop Registry
+        }
+
+        MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+        WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+    });
+}
+
 void LuaInterface::ScanPlayers(HANDLE hPipe) {
     SafeInvoke([&]() {
-        if (!m_L) return;
+        if (!m_L) {
+            std::string msg = "Lua State not ready.";
+            MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+            WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+            return;
+        }
         if (!p_getglobal) return;
 
         p_getglobal(m_L, "Players");
@@ -723,7 +856,13 @@ void LuaInterface::ScanPlayers(HANDLE hPipe) {
 
 void LuaInterface::DumpScripts(HANDLE hPipe) {
     SafeInvoke([&]() {
-        if (!m_L) return;
+        if (!m_L) {
+            std::string msg = "Lua State not ready.";
+            MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+            WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+            return;
+        }
         if (!p_getglobal || !p_pushnil || !p_next || !p_type || !p_tolstring || !p_settop) return;
 
         std::string out = "Discovered Scripts (Functions in _G):\n";
@@ -765,31 +904,46 @@ int Writer(lua_State* L, const void* p, size_t sz, void* ud) {
 
 void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
     SafeInvoke([&]() {
-        if (!m_L) return;
+        if (!m_L) {
+            std::string msg = "Lua State not ready.";
+            MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+            DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
+            WriteFile(hPipe, msg.data(), msg.size(), &w, NULL);
+            return;
+        }
         std::string src = GetOverride(name);
 
         if (src.empty()) {
-            if (!p_dump) {
-                 src = "-- Source retrieval unavailable: lua_dump not found.\n-- You can set an Override for this script.";
-            } else if (p_getglobal && p_getfield) {
+            if (p_getglobal && p_getfield) {
                 p_getglobal(m_L, "_G");
                 p_getfield(m_L, -1, name.c_str());
                 if (p_type(m_L, -1) == 6) {
-                    std::string bytecode;
-                    if (p_dump(m_L, Writer, &bytecode, 0) == 0) {
-                        std::string hex;
-                        size_t limit = bytecode.size();
-                        if (limit > 8192) limit = 8192;
-                        hex.reserve(limit * 3 + 128);
-                        char buf[4];
-                        for (size_t i = 0; i < limit; i++) {
-                            sprintf_s(buf, "%02X ", (unsigned char)bytecode[i]);
-                            hex += buf;
-                            if ((i + 1) % 16 == 0) hex += "\n";
+                    if (p_iscfunction && p_iscfunction(m_L, -1)) {
+                        src = "-- Source for " + name + "\n-- [C Function] (No Bytecode Available)";
+                    } else if (!p_dump) {
+                        src = "-- Source retrieval unavailable: lua_dump not found.\n-- You can set an Override for this script.";
+                    } else {
+                        std::string bytecode;
+                        int dumpRes = p_dump(m_L, Writer, &bytecode, 0);
+                        if (dumpRes == 0) {
+                            std::string hex;
+                            size_t limit = bytecode.size();
+                            if (limit > 8192) limit = 8192;
+                            hex.reserve(limit * 3 + 128);
+                            char buf[4];
+                            for (size_t i = 0; i < limit; i++) {
+                                sprintf_s(buf, "%02X ", (unsigned char)bytecode[i]);
+                                hex += buf;
+                                if ((i + 1) % 16 == 0) hex += "\n";
+                            }
+                            if (bytecode.size() > limit) hex += "\n... (Truncated)";
+                            src = "-- Bytecode Dump (" + std::to_string(bytecode.size()) + " bytes):\n" + hex;
+                        } else {
+                            src = "-- Source for " + name + "\n-- (lua_dump failed with error: " + std::to_string(dumpRes) + ")\n-- You can set an Override for this script.";
                         }
-                        if (bytecode.size() > limit) hex += "\n... (Truncated)";
-                        src = "-- Bytecode Dump (" + std::to_string(bytecode.size()) + " bytes):\n" + hex;
                     }
+                } else {
+                    src = "-- Source for " + name + "\n-- (Object is not a function)\n";
                 }
                 p_settop(m_L, -3);
             }
@@ -880,6 +1034,8 @@ bool LuaInterface::ProcessTasks() {
             ScanPlayers(t.pipe);
         } else if (t.type == CMD_DUMP_REGISTRY) {
             DumpRegistry(t.pipe);
+        } else if (t.type == CMD_INSPECT_REGISTRY_ITEM) {
+            InspectRegistryItem(t.pipe, t.payload);
         } else if (t.type == CMD_DUMP_SCRIPTS) {
             DumpScripts(t.pipe);
         } else if (t.type == CMD_GET_SCRIPT_SOURCE) {

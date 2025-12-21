@@ -241,6 +241,7 @@ char filter_buf[128] = "";
 // Data Caches
 std::vector<std::string> player_list;
 std::vector<std::string> registry_list;
+std::vector<std::string> inspector_list;
 std::vector<std::string> script_list;
 std::string current_script_source;
 std::string console_log;
@@ -325,6 +326,10 @@ int main(int argc, char* argv[]) {
             ImGui::Begin("LuaTool", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
             if (ImGui::BeginTabBar("MainTabs")) {
+                // Shared state for navigation
+                static bool requestInspectorFocus = false;
+                static std::string inspectorKey = "";
+
                 if (ImGui::BeginTabItem("Connection")) {
                     ImGui::Text("Processes");
                     ImGui::Separator();
@@ -423,7 +428,10 @@ int main(int argc, char* argv[]) {
                         if (!rFilter[0] || registry_list[i].find(rFilter) != std::string::npos) rIndices.push_back(i);
                     }
 
-                    if (ImGui::BeginTable("RegistryTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                    // Selection state
+                    static int selectedRegistryRow = -1;
+
+                    if (ImGui::BeginTable("RegistryTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
                         ImGui::TableSetupColumn("Key");
                         ImGui::TableSetupColumn("Type");
                         ImGui::TableSetupColumn("Value");
@@ -437,10 +445,80 @@ int main(int argc, char* argv[]) {
                                 auto cols = ParseRow(registry_list[idx]);
                                 if (cols.size() >= 3) {
                                     ImGui::TableNextRow();
-                                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+
+                                    // Selectable Row
+                                    bool isSelected = (selectedRegistryRow == idx);
+                                    ImGui::TableSetColumnIndex(0);
+                                    if (ImGui::Selectable(cols[0].c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                                        selectedRegistryRow = idx;
+                                    }
+                                    // Context Menu
+                                    if (ImGui::BeginPopupContextItem()) {
+                                        if (cols[1].find("table") != std::string::npos || cols[1].find("userdata") != std::string::npos) {
+                                             if (ImGui::Selectable("Inspect")) {
+                                                 inspectorKey = cols[0];
+                                                 requestInspectorFocus = true;
+                                                 if (selected_pid > 0) {
+                                                     inspector_list.clear();
+                                                     inspector_list.push_back("Loading...");
+                                                     RemoteAgent::Get().Send(selected_pid, CMD_INSPECT_REGISTRY_ITEM, inspectorKey);
+                                                 }
+                                             }
+                                        }
+                                        ImGui::EndPopup();
+                                    }
+
                                     ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str());
                                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str());
                                 }
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::EndTabItem();
+                }
+
+                // Handle Focus Request
+                ImGuiTabItemFlags inspectorFlags = 0;
+                if (requestInspectorFocus) {
+                    inspectorFlags |= ImGuiTabItemFlags_SetSelected;
+                    requestInspectorFocus = false;
+                }
+
+                if (ImGui::BeginTabItem("Inspector", NULL, inspectorFlags)) {
+                    ImGui::Text("Inspecting: %s", inspectorKey.empty() ? "(None)" : inspectorKey.c_str());
+                    if (ImGui::Button("Refresh") && selected_pid > 0 && !inspectorKey.empty()) {
+                        RemoteAgent::Get().Send(selected_pid, CMD_INSPECT_REGISTRY_ITEM, inspectorKey);
+                    }
+                    ImGui::Separator();
+
+                    static char iFilter[64] = "";
+                    ImGui::InputText("Filter##I", iFilter, 64);
+
+                    if (ImGui::BeginTable("InspectorTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
+                        ImGui::TableSetupColumn("Key");
+                        ImGui::TableSetupColumn("Type");
+                        ImGui::TableSetupColumn("Value");
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& row : inspector_list) {
+                            if (row == "Loading...") {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0); ImGui::Text("Loading...");
+                                continue;
+                            }
+                            if (iFilter[0] && row.find(iFilter) == std::string::npos) continue;
+
+                            auto cols = ParseRow(row);
+                            if (cols.size() >= 3) {
+                                 ImGui::TableNextRow();
+                                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+                                 ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str());
+                                 ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str());
+                            } else if (cols.size() == 1) {
+                                 // Header or message
+                                 ImGui::TableNextRow();
+                                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
                             }
                         }
                         ImGui::EndTable();
@@ -614,6 +692,15 @@ int main(int argc, char* argv[]) {
                     size_t pos = 0;
                     while ((pos = data.find('\n')) != std::string::npos) {
                         player_list.push_back(data.substr(0, pos));
+                        data.erase(0, pos + 1);
+                    }
+                }
+                else if (l.find("Inspection Results for:") != std::string::npos) {
+                    inspector_list.clear();
+                    std::string data = l.substr(l.find('\n') + 1);
+                    size_t pos = 0;
+                    while ((pos = data.find('\n')) != std::string::npos) {
+                        inspector_list.push_back(data.substr(0, pos));
                         data.erase(0, pos + 1);
                     }
                 }
