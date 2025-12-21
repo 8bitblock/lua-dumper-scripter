@@ -375,20 +375,31 @@ int main(int argc, char* argv[]) {
                     static char pFilter[64] = "";
                     ImGui::InputText("Filter##P", pFilter, 64);
 
+                    static std::vector<int> pIndices;
+                    pIndices.clear();
+                    pIndices.reserve(player_list.size());
+                    for (int i = 0; i < (int)player_list.size(); ++i) {
+                        if (!pFilter[0] || player_list[i].find(pFilter) != std::string::npos) pIndices.push_back(i);
+                    }
+
                     if (ImGui::BeginTable("PlayersTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
                         ImGui::TableSetupColumn("Name");
                         ImGui::TableSetupColumn("Address");
                         ImGui::TableSetupColumn("Position");
                         ImGui::TableHeadersRow();
 
-                        for (const auto& rowStr : player_list) {
-                            if (pFilter[0] && rowStr.find(pFilter) == std::string::npos) continue;
-                            auto cols = ParseRow(rowStr);
-                            if (cols.size() >= 1) {
-                                ImGui::TableNextRow();
-                                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
-                                if (cols.size() >= 2) { ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str()); }
-                                if (cols.size() >= 3) { ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str()); }
+                        ImGuiListClipper clipper;
+                        clipper.Begin((int)pIndices.size());
+                        while (clipper.Step()) {
+                            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                                int idx = pIndices[i];
+                                auto cols = ParseRow(player_list[idx]);
+                                if (cols.size() >= 1) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+                                    if (cols.size() >= 2) { ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str()); }
+                                    if (cols.size() >= 3) { ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str()); }
+                                }
                             }
                         }
                         ImGui::EndTable();
@@ -405,20 +416,31 @@ int main(int argc, char* argv[]) {
                     static char rFilter[64] = "";
                     ImGui::InputText("Filter##R", rFilter, 64);
 
+                    static std::vector<int> rIndices;
+                    rIndices.clear();
+                    rIndices.reserve(registry_list.size());
+                    for (int i = 0; i < (int)registry_list.size(); ++i) {
+                        if (!rFilter[0] || registry_list[i].find(rFilter) != std::string::npos) rIndices.push_back(i);
+                    }
+
                     if (ImGui::BeginTable("RegistryTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
                         ImGui::TableSetupColumn("Key");
                         ImGui::TableSetupColumn("Type");
                         ImGui::TableSetupColumn("Value");
                         ImGui::TableHeadersRow();
 
-                        for (const auto& rowStr : registry_list) {
-                            if (rFilter[0] && rowStr.find(rFilter) == std::string::npos) continue;
-                            auto cols = ParseRow(rowStr);
-                            if (cols.size() >= 3) {
-                                ImGui::TableNextRow();
-                                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
-                                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str());
-                                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str());
+                        ImGuiListClipper clipper;
+                        clipper.Begin((int)rIndices.size());
+                        while (clipper.Step()) {
+                            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                                int idx = rIndices[i];
+                                auto cols = ParseRow(registry_list[idx]);
+                                if (cols.size() >= 3) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(cols[0].c_str());
+                                    ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(cols[1].c_str());
+                                    ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(cols[2].c_str());
+                                }
                             }
                         }
                         ImGui::EndTable();
@@ -433,16 +455,32 @@ int main(int argc, char* argv[]) {
                     ImGui::Separator();
 
                     ImGui::BeginGroup();
+                    static char sFilter[64] = "";
+                    ImGui::InputText("Filter##S", sFilter, 64);
+
                     ImGui::BeginChild("ScriptList", ImVec2(250, 0), true);
                     static int selectedScript = -1;
-                    for (int i = 0; i < (int)script_list.size(); i++) {
-                        std::vector<std::string> cols = ParseRow(script_list[i]);
-                        std::string name = cols.empty() ? "?" : cols[0];
-                        if (ImGui::Selectable(name.c_str(), selectedScript == i)) {
-                            selectedScript = i;
-                            current_script_source = "Loading...";
-                            if (selected_pid > 0) {
-                                RemoteAgent::Get().Send(selected_pid, CMD_GET_SCRIPT_SOURCE, name);
+
+                    static std::vector<int> sIndices;
+                    sIndices.clear();
+                    sIndices.reserve(script_list.size());
+                    for (int i = 0; i < (int)script_list.size(); ++i) {
+                        if (!sFilter[0] || script_list[i].find(sFilter) != std::string::npos) sIndices.push_back(i);
+                    }
+
+                    ImGuiListClipper clipper;
+                    clipper.Begin((int)sIndices.size());
+                    while (clipper.Step()) {
+                        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                            int idx = sIndices[i];
+                            std::vector<std::string> cols = ParseRow(script_list[idx]);
+                            std::string name = cols.empty() ? "?" : cols[0];
+                            if (ImGui::Selectable(name.c_str(), selectedScript == idx)) {
+                                selectedScript = idx;
+                                current_script_source = "Loading...";
+                                if (selected_pid > 0) {
+                                    RemoteAgent::Get().Send(selected_pid, CMD_GET_SCRIPT_SOURCE, name);
+                                }
                             }
                         }
                     }
@@ -480,31 +518,37 @@ int main(int argc, char* argv[]) {
                     std::filesystem::create_directory("scripts");
 
                     static std::string selectedFile = "";
+                    static char fileNameBuf[64] = "new_script.lua";
+
                     ImGui::BeginChild("FileList", ImVec2(0, 200), true);
+                    if (ImGui::Button("Refresh List")) { /* directory_iterator will pick it up next frame */ }
+                    ImGui::Separator();
+
                     for (const auto& entry : std::filesystem::directory_iterator("scripts")) {
                         if (entry.is_regular_file()) {
                             std::string filename = entry.path().filename().string();
                             if (ImGui::Selectable(filename.c_str(), selectedFile == filename)) {
                                 selectedFile = filename;
+                                strcpy_s(fileNameBuf, filename.c_str()); // Auto-fill filename input
+
+                                // Instant Load
+                                std::ifstream t("scripts/" + selectedFile);
+                                if (t.is_open()) {
+                                    std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
+                                    if (str.length() < IM_ARRAYSIZE(script_buffer)) {
+                                        strcpy_s(script_buffer, str.c_str());
+                                        output_log += "[Sys] Loaded " + selectedFile + "\n";
+                                    } else {
+                                        output_log += "[Sys] Error: Script too large for buffer.\n";
+                                    }
+                                }
                             }
                         }
                     }
                     ImGui::EndChild();
 
-                    static char fileNameBuf[64] = "new_script.lua";
                     ImGui::InputText("Filename", fileNameBuf, 64);
 
-                    if (ImGui::Button("Load") && !selectedFile.empty()) {
-                        std::ifstream t("scripts/" + selectedFile);
-                        if (t.is_open()) {
-                            std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-                            if (str.length() < IM_ARRAYSIZE(script_buffer)) {
-                                strcpy_s(script_buffer, str.c_str());
-                                output_log += "[Sys] Loaded " + selectedFile + "\n";
-                            }
-                        }
-                    }
-                    ImGui::SameLine();
                     if (ImGui::Button("Save")) {
                         std::string fname = fileNameBuf;
                         if (fname.find(".lua") == std::string::npos) fname += ".lua";
@@ -512,7 +556,14 @@ int main(int argc, char* argv[]) {
                         if (t.is_open()) {
                             t << script_buffer;
                             output_log += "[Sys] Saved to " + fname + "\n";
+                            selectedFile = fname; // Auto-select saved file
                         }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear")) {
+                        script_buffer[0] = 0;
+                        selectedFile = "";
+                        strcpy_s(fileNameBuf, "new_script.lua");
                     }
 
                     ImGui::NextColumn();
