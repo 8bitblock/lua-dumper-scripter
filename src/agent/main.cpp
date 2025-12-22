@@ -31,8 +31,8 @@ typedef int         (*lua_rawgeti_t)(lua_State *L, int idx, long long n);
 typedef int         (*lua_iscfunction_t)(lua_State *L, int idx);
 typedef int         (*luaL_loadbufferx_t)(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
 typedef int         (*luaL_loadstring_t)(lua_State *L, const char *s);
-typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
-typedef void        (*lua_callk_t)(lua_State *L, int nargs, int nresults, long ctx, void* k);
+typedef int         (*lua_pcallk_t)(lua_State *L, int nargs, int nresults, int errfunc, intptr_t ctx, void* k);
+typedef void        (*lua_callk_t)(lua_State *L, int nargs, int nresults, intptr_t ctx, void* k);
 typedef void        (*lua_pushcclosure_t)(lua_State *L, int (*fn)(lua_State *), int n);
 typedef void        (*lua_setglobal_t)(lua_State *L, const char *name);
 typedef void        (*lua_getglobal_t)(lua_State *L, const char *name);
@@ -47,16 +47,18 @@ void CallStdFunc(void* p) {
 }
 
 // Function with NO C++ objects requiring unwinding
-void SafeInvokeInternal(void(*cb)(void*), void* arg) {
+bool SafeInvokeInternal(void(*cb)(void*), void* arg) {
     __try {
         cb(arg);
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        printf("[Agent] Exception intercepted in SafeInvoke.\n");
+        printf("[Agent] Exception intercepted in SafeInvoke. Code: 0x%X\n", GetExceptionCode());
+        return false;
     }
 }
 
-void SafeInvoke(std::function<void()> fn) {
-    SafeInvokeInternal(CallStdFunc, &fn);
+bool SafeInvoke(std::function<void()> fn) {
+    return SafeInvokeInternal(CallStdFunc, &fn);
 }
 
 // ----------------------------------------------------------------------------
@@ -74,12 +76,12 @@ public:
 
     // API Wrappers
     bool LoadScript(const std::string& script, std::string& error);
-    void DumpGlobals(HANDLE hPipe);
-    void ScanPlayers(HANDLE hPipe);
-    void DumpRegistry(HANDLE hPipe);
-    void InspectRegistryItem(HANDLE hPipe, const std::string& keyStr);
-    void DumpScripts(HANDLE hPipe);
-    void GetScriptSource(HANDLE hPipe, const std::string& name);
+    bool DumpGlobals(HANDLE hPipe);
+    bool ScanPlayers(HANDLE hPipe);
+    bool DumpRegistry(HANDLE hPipe);
+    bool InspectRegistryItem(HANDLE hPipe, const std::string& keyStr);
+    bool DumpScripts(HANDLE hPipe);
+    bool GetScriptSource(HANDLE hPipe, const std::string& name);
 
     // Hooking
     void EnableHook();
@@ -90,6 +92,8 @@ public:
     // Accessors
     void SetState(lua_State* L) { m_L = L; }
     lua_State* GetState() const { return m_L; }
+
+    std::string FormatLuaValue(int idx);
 
     void AddOverride(const std::string& name, const std::string& source) {
         std::lock_guard<std::mutex> lock(m_OverrideMutex);
@@ -110,10 +114,14 @@ public:
 
     // Public member for MyLuaPrint and others
     lua_getglobal_t p_getglobal = nullptr;
+    void* p_pcallk_trampoline = nullptr;
+
+    std::string GetBytecodeViaLua(const std::string& name);
 
 private:
     LuaInterface() = default;
     bool ResolveSymbols(HMODULE hMod);
+    void CreateTrampoline(void* target, void*& trampoline);
 
     lua_State* m_L = nullptr;
     bool m_Loaded = false;
@@ -150,28 +158,29 @@ private:
     struct Hook {
         void* target;
         void* detour;
-        uint8_t original[16];
+        uint8_t original[32];
+        int size;
         bool active;
     };
     std::vector<Hook> m_Hooks;
 
-    std::atomic<bool> m_RecursionGuard = false;
     uint32_t m_LastTick = 0;
 
-    friend int MyLuaGetTop(lua_State *L);
     friend int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name, const char *mode);
     friend int MyLuaLoadString(lua_State* L, const char* s);
     friend int MyLuaPcall(lua_State *L, int nargs, int nresults, int errfunc);
-    friend int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k);
+    friend int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, intptr_t ctx, void* k);
     friend void MyLuaSetTop(lua_State *L, int idx);
     friend int MyLuaPrint(lua_State* L);
     friend void HookProcessHelper(LuaInterface& lua, lua_State* L);
 };
 
-// ... (HookProcessHelper, MyLuaGetTop, etc.) ...
+// ... (HookProcessHelper, etc.) ...
 void HookProcessHelper(LuaInterface& lua, lua_State* L) {
-    if (lua.m_RecursionGuard) return;
-    lua.m_RecursionGuard = true;
+    static thread_local bool s_InHook = false;
+    if (s_InHook) return;
+    s_InHook = true;
+
     lua.SetState(L);
 
     static bool printHooked = false;
@@ -185,22 +194,16 @@ void HookProcessHelper(LuaInterface& lua, lua_State* L) {
     uint32_t now = GetTickCount();
     if (now - lua.m_LastTick > 10) {
         if (HasPendingTasks()) {
-            lua.DisableHook();
+            // Note: Trampoline hooks don't need DisableHook/EnableHook for the calls *they* replace,
+            // but standard hooks (like pcall) might.
+            // However, since we are using trampolines for gettop/settop/etc., calling Lua API functions inside ProcessTasks
+            // will hit the trampoline hook again.
+            // s_InHook protects against infinite recursion here.
             lua.ProcessTasks();
-            lua.EnableHook();
         }
         lua.m_LastTick = now;
     }
-    lua.m_RecursionGuard = false;
-}
-
-int MyLuaGetTop(lua_State *L) {
-    auto& lua = LuaInterface::Get();
-    HookProcessHelper(lua, L);
-    lua.DisableHook();
-    int ret = lua.p_gettop(L);
-    lua.EnableHook();
-    return ret;
+    s_InHook = false;
 }
 
 int MyLuaLoadBufferX(lua_State* L, const char *buff, size_t sz, const char *name, const char *mode) {
@@ -236,22 +239,30 @@ int MyLuaLoadString(lua_State* L, const char* s) {
 
 int MyLuaPcall(lua_State *L, int nargs, int nresults, int errfunc) {
     auto& lua = LuaInterface::Get();
-    HookProcessHelper(lua, L);
-    lua.DisableHook();
-    int ret = 0;
-    if (lua.p_pcallk) ret = lua.p_pcallk(L, nargs, nresults, errfunc, 0, nullptr);
-    lua.EnableHook();
-    return ret;
+
+    // Check pending tasks
+    extern bool HasPendingTasks();
+    if (HasPendingTasks()) HookProcessHelper(lua, L);
+
+    // Call via trampoline if available
+    if (lua.p_pcallk_trampoline) {
+        return ((lua_pcallk_t)lua.p_pcallk_trampoline)(L, nargs, nresults, errfunc, 0, nullptr);
+    }
+
+    // Fallback (shouldn't happen if initialized correctly)
+    return 0;
 }
 
-int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, long ctx, void* k) {
+int MyLuaPcallK(lua_State *L, int nargs, int nresults, int errfunc, intptr_t ctx, void* k) {
     auto& lua = LuaInterface::Get();
-    HookProcessHelper(lua, L);
-    lua.DisableHook();
-    int ret = 0;
-    if (lua.p_pcallk) ret = lua.p_pcallk(L, nargs, nresults, errfunc, ctx, k);
-    lua.EnableHook();
-    return ret;
+
+    extern bool HasPendingTasks();
+    if (HasPendingTasks()) HookProcessHelper(lua, L);
+
+    if (lua.p_pcallk_trampoline) {
+        return ((lua_pcallk_t)lua.p_pcallk_trampoline)(L, nargs, nresults, errfunc, ctx, k);
+    }
+    return 0;
 }
 
 void MyLuaSetTop(lua_State *L, int idx) {
@@ -290,8 +301,182 @@ int MyLuaPrint(lua_State* L) {
 }
 
 // ----------------------------------------------------------------------------
+// Helper: FormatLuaValue
+// ----------------------------------------------------------------------------
+std::string LuaInterface::FormatLuaValue(int idx) {
+    if (!m_L || !p_type) return "Error";
+    int type = p_type(m_L, idx);
+    if (type == 3 && p_tonumber) {
+        char buf[64]; sprintf_s(buf, "%.14g", p_tonumber(m_L, idx)); return buf;
+    } else if (type == 1 && p_toboolean) {
+        return p_toboolean(m_L, idx) ? "true" : "false";
+    } else if (type == 4 && p_tolstring) {
+        const char* s = p_tolstring(m_L, idx, NULL);
+        return s ? s : "";
+    } else if ((type == 5 || type == 6 || type == 8) && p_topointer) {
+        const void* ptr = p_topointer(m_L, idx);
+        char buf[32]; sprintf_s(buf, "0x%p", ptr);
+        return buf;
+    }
+    return p_typename ? p_typename(m_L, type) : "Unknown";
+}
+
+std::string LuaInterface::GetBytecodeViaLua(const std::string& name) {
+    if (!m_L || !p_getglobal || !p_getfield || !p_pcallk) return "";
+
+    // stack: []
+    p_getglobal(m_L, "string"); // stack: [string]
+    if (p_type(m_L, -1) != 5) { p_settop(m_L, -2); return ""; }
+
+    p_getfield(m_L, -1, "dump"); // stack: [string, dump]
+    if (p_type(m_L, -1) != 6) { p_settop(m_L, -3); return ""; }
+
+    // Get target function
+    p_getglobal(m_L, "_G"); // stack: [string, dump, _G]
+    p_getfield(m_L, -1, name.c_str()); // stack: [string, dump, _G, func]
+
+    if (p_type(m_L, -1) != 6) {
+        p_settop(m_L, -5); // Pop all
+        return "";
+    }
+
+    // Move func to be argument for dump
+    // We want to call dump(func)
+    // stack currently: [string, dump, _G, func]
+    // We need: [string, dump, func] (actually just dump, func)
+
+    // Let's rearrange manually or just pop _G
+    // p_pcall args: nargs=1 (func), nresults=1
+    // Stack before pcall must be: func(dump), arg1(target_func)
+
+    // 1. Copy func to top
+    p_pushvalue(m_L, -1); // [string, dump, _G, func, func_copy]
+
+    // 2. Copy dump to top
+    p_pushvalue(m_L, -4); // [string, dump, _G, func, func_copy, dump_copy]
+
+    // 3. Move dump under func_copy? No, stack for call: [func_to_call, arg1, arg2...]
+    // We want: [dump, target_func] at top
+
+    p_settop(m_L, -3); // Pop func_copy, dump_copy? No, wait.
+    // Reset stack logic.
+    // Current: [string, dump, _G, func]
+
+    // We want to call dump(func).
+    // Push dump (copy)
+    p_pushvalue(m_L, -3); // [string, dump, _G, func, dump]
+    // Push func (copy)
+    p_pushvalue(m_L, -2); // [string, dump, _G, func, dump, func]
+
+    // Call: 1 arg, 1 result
+    int res = 0;
+    if (p_pcallk) res = p_pcallk(m_L, 1, 1, 0, 0, nullptr);
+    else if (p_callk) p_callk(m_L, 1, 1, 0, nullptr);
+
+    // Stack: [string, dump, _G, func, result_string] (if success)
+    // or [string, dump, _G, func, error_msg] (if fail)
+
+    std::string bytecode = "";
+    if (res == 0 && p_type(m_L, -1) == 4) {
+        size_t len = 0;
+        const char* s = p_tolstring(m_L, -1, &len);
+        if (s) {
+            // Format as Hex
+            std::string hex;
+            size_t limit = len;
+            if (limit > 8192) limit = 8192;
+            hex.reserve(limit * 3 + 128);
+            char buf[4];
+            for (size_t i = 0; i < limit; i++) {
+                sprintf_s(buf, "%02X ", (unsigned char)s[i]);
+                hex += buf;
+                if ((i + 1) % 16 == 0) hex += "\n";
+            }
+            if (len > limit) hex += "\n... (Truncated)";
+            bytecode = "-- Bytecode via string.dump (" + std::to_string(len) + " bytes):\n" + hex;
+        }
+    }
+
+    // Clean up: Pop 5 items [string, dump, _G, func, result]
+    p_settop(m_L, -6);
+
+    return bytecode;
+}
+
 // Helper: FindPattern (IDA Style)
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Minimal Length Disassembler (LDE) for x64 Prologues
+// ----------------------------------------------------------------------------
+int GetInstructionLength(uint8_t* ip) {
+    uint8_t b = *ip;
+
+    // 1. PUSH reg / POP reg (50-5F)
+    if (b >= 0x50 && b <= 0x5F) return 1;
+
+    // 2. REX Prefixes (40-4F)
+    if (b >= 0x40 && b <= 0x4F) {
+        // Next byte is opcode
+        uint8_t op = *(ip + 1);
+
+        // PUSH/POP with REX (e.g. 40 53 -> PUSH RBX)
+        if (op >= 0x50 && op <= 0x5F) return 2;
+
+        // MOV [RSP+disp8], Reg (48 89 5C 24 08)
+        // 48 89 ModRM(5C) SIB(24) Disp8(08)
+        if (op == 0x89) {
+            uint8_t modrm = *(ip + 2);
+            // ModRM: Mod(2) Reg(3) RM(3)
+            // Check for SIB byte (RM=4, i.e., 100 binary)
+            int hasSIB = ((modrm & 0x07) == 0x04);
+            int dispSize = 0;
+            int mod = (modrm >> 6);
+            if (mod == 1) dispSize = 1;
+            if (mod == 2) dispSize = 4;
+            // mod=0 usually 0 disp, unless RM=5 (RIP rel)
+
+            // Simplification for common prologue moves:
+            // 48 89 5C 24 08 -> Mod=1(disp8), RM=4(SIB) -> 1+1+1+1+1 = 5
+            return 2 + 1 + (hasSIB ? 1 : 0) + dispSize;
+        }
+
+        // SUB RSP, imm8 (48 83 EC 20)
+        if (op == 0x83) return 4;
+
+        // SUB RSP, imm32 (48 81 EC ...)
+        if (op == 0x81) return 7;
+
+        // MOV RBP, RSP (48 8B EC)
+        if (op == 0x8B) return 3;
+    }
+
+    // 3. SUB RSP, imm8 (without REX? usually has REX for 64-bit operand, but could be 32-bit stack op)
+
+    // 4. MOV [RSP+...], ... (No REX)
+    if (b == 0x89) {
+         uint8_t modrm = *(ip + 1);
+         int hasSIB = ((modrm & 0x07) == 0x04);
+         int dispSize = 0;
+         int mod = (modrm >> 6);
+         if (mod == 1) dispSize = 1;
+         if (mod == 2) dispSize = 4;
+         return 1 + 1 + (hasSIB ? 1 : 0) + dispSize;
+    }
+
+    return 0; // Unknown
+}
+
+int CalcTrampolineSize(void* target, int minSize) {
+    int size = 0;
+    uint8_t* p = (uint8_t*)target;
+    while (size < minSize) {
+        int len = GetInstructionLength(p + size);
+        if (len == 0) return 0; // Unknown instruction, unsafe to hook
+        size += len;
+    }
+    return size;
+}
+
 uintptr_t FindPattern(HMODULE hMod, const char* signature) {
     MODULEINFO modInfo;
     if (!GetModuleInformation(GetCurrentProcess(), hMod, &modInfo, sizeof(MODULEINFO))) return 0;
@@ -331,6 +516,60 @@ uintptr_t FindPattern(HMODULE hMod, const char* signature) {
         if (found) return i;
     }
     return 0;
+}
+
+void LuaInterface::CreateTrampoline(void* target, void*& trampoline) {
+    if (!target) return;
+
+    // Safety: Calculate exact size of instructions to steal (>= 12 bytes)
+    int stolenSize = CalcTrampolineSize(target, 12);
+    if (stolenSize == 0) {
+        std::cout << "[Agent] Unsafe Trampoline (Complex Prologue). Aborting." << std::endl;
+        trampoline = nullptr;
+        return;
+    }
+
+    // Safety: Check for relative instructions in the stolen bytes
+    uint8_t* t = (uint8_t*)target;
+    for (int i = 0; i < stolenSize; i++) {
+        uint8_t b = t[i];
+        if (b == 0xE8 || b == 0xE9 || b == 0xEB) {
+            std::cout << "[Agent] Unsafe Trampoline detected (Relative Jump/Call) at +" << i << ". Aborting Trampoline." << std::endl;
+            trampoline = nullptr;
+            return;
+        }
+    }
+
+    void* buffer = VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!buffer) return;
+
+    // Copy stolen instructions
+    memcpy(buffer, target, stolenSize);
+
+    // Write JMP back to target + stolenSize
+    uint8_t* p = (uint8_t*)buffer + stolenSize;
+    // MOV RAX, target + stolenSize
+    *p++ = 0x48; *p++ = 0xB8;
+    uintptr_t dest = (uintptr_t)target + stolenSize;
+    memcpy(p, &dest, 8);
+    p += 8;
+    // JMP RAX
+    *p++ = 0xFF; *p++ = 0xE0;
+
+    FlushInstructionCache(GetCurrentProcess(), buffer, 64);
+    trampoline = buffer;
+
+    // NOTE: Actual hook installation (overwriting target) is done in EnableHook or here?
+    // The previous code did it in EnableHook using hardcoded 12.
+    // We must update m_Hooks to store the stolenSize so EnableHook knows how many NOPs to write.
+    // However, Hook struct doesn't have size.
+    // For simplicity, we can do the patching HERE if we change how hooks are managed,
+    // OR we assume 12 bytes for the JMP and just patch the NOPs here?
+    // Wait, EnableHook overwrites 12 bytes. If stolenSize > 12, we need to NOP bytes 12..(stolenSize-1).
+    // We can do that here? No, if we DisableHook, we need to restore ALL stolen bytes.
+    // The Hook struct needs to know 'stolenSize'.
+
+    std::cout << "[Agent] Created Trampoline for " << target << " (Size: " << stolenSize << ")" << std::endl;
 }
 
 void LuaInterface::Initialize() {
@@ -418,6 +657,8 @@ bool LuaInterface::ResolveSymbols(HMODULE hMod) {
 
     // Add lua_dump pattern
     p_dump = (lua_dump_t)Resolve("lua_dump", "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 30 48 8B 02 48 8B F9");
+    if (p_dump) std::cout << "[Agent] Found lua_dump." << std::endl;
+    else std::cout << "[Agent] lua_dump NOT found." << std::endl;
 
     p_pcallk = (lua_pcallk_t)Resolve("lua_pcallk");
     if (!p_pcallk) p_pcallk = (lua_pcallk_t)Resolve("lua_pcall");
@@ -432,20 +673,49 @@ bool LuaInterface::ResolveSymbols(HMODULE hMod) {
         return false;
     }
 
-    auto AddHook = [&](void* target, void* detour, const char* name) {
+    auto AddHook = [&](void* target, void* detour, const char* name, int size = 12) {
         if (!target) return;
         Hook h;
         h.target = target;
         h.detour = detour;
+        h.size = size;
         h.active = false;
-        memcpy(h.original, target, 12);
+        memcpy(h.original, target, size);
         m_Hooks.push_back(h);
-        std::cout << "[Agent] Added Hook: " << name << " at " << target << std::endl;
+        std::cout << "[Agent] Added Hook: " << name << " at " << target << " (Size: " << size << ")" << std::endl;
     };
 
-    if (p_pcallk) AddHook((void*)p_pcallk, (void*)MyLuaPcallK, "lua_pcallk");
-    if (p_loadbufferx) AddHook((void*)p_loadbufferx, (void*)MyLuaLoadBufferX, "luaL_loadbufferx");
-    if (p_loadstring) AddHook((void*)p_loadstring, (void*)MyLuaLoadString, "luaL_loadstring");
+    // Standard Hooks (Assume 12 bytes is safe for start of functions usually, but standard hooks restore original so tearing is less critical if we don't execute partials... wait, we do)
+    // Actually, for standard hooks we disable, execute original, enable.
+    // If we tore an instruction, 'Disable' restores it fully, so it's fine.
+    // So 12 bytes is fine for standard hooks as long as we don't crash WRITING them (atomicity?).
+    // But we use VirtualProtect, so it's not atomic. But we are in a single thread usually when hooking? No, game threads run.
+    // Ideally we should use the same LDE logic for ALL hooks.
+
+    int sz = 0;
+
+    if (p_loadbufferx) {
+        sz = CalcTrampolineSize((void*)p_loadbufferx, 12);
+        if (sz > 0) AddHook((void*)p_loadbufferx, (void*)MyLuaLoadBufferX, "luaL_loadbufferx", sz);
+    }
+
+    if (p_loadstring) {
+        sz = CalcTrampolineSize((void*)p_loadstring, 12);
+        if (sz > 0) AddHook((void*)p_loadstring, (void*)MyLuaLoadString, "luaL_loadstring", sz);
+    }
+
+    // Trampoline Hooks
+    if (p_pcallk) {
+        // CreateTrampoline now returns the trampoline address but we need to know the stolen size for the hook
+        // Let's modify CreateTrampoline to return size or just recalculate it?
+        // CreateTrampoline prints it. Let's make CreateTrampoline return the size via reference?
+        // Or just recalculate it here.
+        int trampolineSize = CalcTrampolineSize((void*)p_pcallk, 12);
+        if (trampolineSize > 0) {
+            CreateTrampoline((void*)p_pcallk, p_pcallk_trampoline);
+            if (p_pcallk_trampoline) AddHook((void*)p_pcallk, (void*)MyLuaPcallK, "lua_pcallk", trampolineSize);
+        }
+    }
 
     if (!m_Hooks.empty()) {
         EnableHook();
@@ -462,15 +732,24 @@ void LuaInterface::EnableHook() {
     for (auto& h : m_Hooks) {
         if (h.active) continue;
         DWORD old;
-        VirtualProtect(h.target, 12, PAGE_EXECUTE_READWRITE, &old);
+        VirtualProtect(h.target, h.size, PAGE_EXECUTE_READWRITE, &old);
+
+        // 1. Write Absolute JMP (12 bytes)
         uint8_t patch[12];
         patch[0] = 0x48; patch[1] = 0xB8;
         uintptr_t dest = (uintptr_t)h.detour;
         memcpy(&patch[2], &dest, 8);
         patch[10] = 0xFF; patch[11] = 0xE0;
+
         memcpy(h.target, patch, 12);
-        VirtualProtect(h.target, 12, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), h.target, 12);
+
+        // 2. NOP remaining bytes
+        if (h.size > 12) {
+            memset((uint8_t*)h.target + 12, 0x90, h.size - 12);
+        }
+
+        VirtualProtect(h.target, h.size, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), h.target, h.size);
         h.active = true;
     }
 }
@@ -479,10 +758,10 @@ void LuaInterface::DisableHook() {
     for (auto& h : m_Hooks) {
         if (!h.active) continue;
         DWORD old;
-        VirtualProtect(h.target, 12, PAGE_EXECUTE_READWRITE, &old);
-        memcpy(h.target, h.original, 12);
-        VirtualProtect(h.target, 12, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), h.target, 12);
+        VirtualProtect(h.target, h.size, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(h.target, h.original, h.size);
+        VirtualProtect(h.target, h.size, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), h.target, h.size);
         h.active = false;
     }
 }
@@ -521,8 +800,8 @@ bool LuaInterface::LoadScript(const std::string& script, std::string& error) {
 // Wrapped Dump Functions
 // ----------------------------------------------------------------------------
 
-void LuaInterface::DumpGlobals(HANDLE hPipe) {
-    SafeInvoke([&]() {
+bool LuaInterface::DumpGlobals(HANDLE hPipe) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -564,25 +843,26 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
                 }
                 if (count > 50000) { out.append("... [Truncated]\n"); p_settop(m_L, -3); break; }
 
+                // Safe Key Formatting (Copy first)
                 p_pushvalue(m_L, -2);
-                const char* key = p_tolstring(m_L, -1, NULL);
-                if (key) out.append(key); else out.append("(non-string key)");
-                p_settop(m_L, -2);
+                std::string kStr = FormatLuaValue(-1);
+                out.append(kStr);
+                p_settop(m_L, -2); // Pop key copy
 
                 int type = p_type(m_L, -1);
                 const char* typeName = p_typename(m_L, type);
                 out.append(" ["); out.append(typeName); out.append("]");
 
-                if (type == 3 && p_tonumber) {
-                     char buf[64]; sprintf_s(buf, " = %.14g", p_tonumber(m_L, -1)); out.append(buf);
-                } else if (type == 1 && p_toboolean) {
-                     out.append(" = "); out.append(p_toboolean(m_L, -1) ? "true" : "false");
-                } else if (type == 4 && p_tolstring) {
-                     out.append(" = \"");
-                     const char* s = p_tolstring(m_L, -1, NULL);
-                     std::string valStr = s ? s : "";
-                     if (valStr.length() > 64) valStr = valStr.substr(0, 61) + "...";
-                     out.append(valStr); out.append("\"");
+                // Safe Value Formatting (Copy first)
+                p_pushvalue(m_L, -1);
+                std::string val = FormatLuaValue(-1);
+                p_settop(m_L, -2); // Pop value copy
+
+                if (type == 4) {
+                     if (val.length() > 64) val = val.substr(0, 61) + "...";
+                     out.append(" = \""); out.append(val); out.append("\"");
+                } else {
+                     out.append(" = "); out.append(val);
                 }
                 out.append("\n");
                 p_settop(m_L, -2);
@@ -594,11 +874,13 @@ void LuaInterface::DumpGlobals(HANDLE hPipe) {
             DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
             WriteFile(hPipe, out.data(), out.size(), &w, NULL);
         }
+        MessageHeader h = { 0, RESP_OK };
+        DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
     });
 }
 
-void LuaInterface::DumpRegistry(HANDLE hPipe) {
-    SafeInvoke([&]() {
+bool LuaInterface::DumpRegistry(HANDLE hPipe) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -641,31 +923,25 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
                 }
                 if (count > 20000) { out.append("... Truncated ...\n"); p_settop(m_L, -3); break; }
 
-                // Key
-                int kType = p_type(m_L, -2);
-                if (kType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.0f", p_tonumber(m_L, -2)); out.append(buf); }
-                else if (kType == 4) { const char* s = p_tolstring(m_L, -2, NULL); if(s) out.append(s); }
-                else out.append(p_typename(m_L, kType));
+                // Key (Copy)
+                p_pushvalue(m_L, -2);
+                std::string kStr = FormatLuaValue(-1);
+                out.append(kStr);
+                p_settop(m_L, -2);
                 out.append("|");
 
+                // Type
                 int vType = p_type(m_L, -1);
                 out.append(p_typename(m_L, vType));
                 out.append("|");
 
-                if (vType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.14g", p_tonumber(m_L, -1)); out.append(buf); }
-                else if (vType == 1 && p_toboolean) out.append(p_toboolean(m_L, -1) ? "true" : "false");
-                else if (vType == 4 && p_tolstring) {
-                    const char* s = p_tolstring(m_L, -1, NULL);
-                    std::string valStr = s ? s : "";
-                    if (valStr.length() > 30) valStr = valStr.substr(0, 27) + "...";
-                    out.append(valStr);
-                }
-                else if ((vType == 5 || vType == 6 || vType == 8) && p_topointer) {
-                    // Table, Function, Thread - Append Address
-                    const void* ptr = p_topointer(m_L, -1);
-                    char buf[32]; sprintf_s(buf, "0x%p", ptr);
-                    out.append(buf);
-                }
+                // Value (Copy)
+                p_pushvalue(m_L, -1);
+                std::string vStr = FormatLuaValue(-1);
+                p_settop(m_L, -2);
+
+                if (vType == 4 && vStr.length() > 30) vStr = vStr.substr(0, 27) + "...";
+                out.append(vStr);
                 out.append("\n");
                 p_settop(m_L, -2);
             }
@@ -675,11 +951,14 @@ void LuaInterface::DumpRegistry(HANDLE hPipe) {
         MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+
+        MessageHeader tok = { 0, RESP_OK };
+        WriteFile(hPipe, &tok, sizeof(tok), &w, NULL);
     });
 }
 
-void LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) {
-    SafeInvoke([&]() {
+bool LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -749,11 +1028,11 @@ void LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) 
                     }
                     if (count > 10000) { out.append("... Truncated ...\n"); p_settop(m_L, -3); break; }
 
-                    // Key
-                    int kType = p_type(m_L, -2);
-                    if (kType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.0f", p_tonumber(m_L, -2)); out.append(buf); }
-                    else if (kType == 4) { const char* s = p_tolstring(m_L, -2, NULL); if(s) out.append(s); }
-                    else out.append(p_typename(m_L, kType));
+                    // Key (Copy)
+                    p_pushvalue(m_L, -2);
+                    std::string kStr = FormatLuaValue(-1);
+                    out.append(kStr);
+                    p_settop(m_L, -2);
                     out.append("|");
 
                     // Value Type
@@ -761,26 +1040,19 @@ void LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) 
                     out.append(p_typename(m_L, vType));
                     out.append("|");
 
-                    // Value
-                    if (vType == 3 && p_tonumber) { char buf[64]; sprintf_s(buf, "%.14g", p_tonumber(m_L, -1)); out.append(buf); }
-                    else if (vType == 1 && p_toboolean) out.append(p_toboolean(m_L, -1) ? "true" : "false");
-                    else if (vType == 4 && p_tolstring) {
-                        const char* s = p_tolstring(m_L, -1, NULL);
-                        std::string valStr = s ? s : "";
-                        if (valStr.length() > 30) valStr = valStr.substr(0, 27) + "...";
-                        out.append(valStr);
-                    }
-                    else if ((vType == 5 || vType == 6 || vType == 8) && p_topointer) {
-                        const void* ptr = p_topointer(m_L, -1);
-                        char buf[32]; sprintf_s(buf, "0x%p", ptr);
-                        out.append(buf);
-                    }
+                    // Value (Copy)
+                    p_pushvalue(m_L, -1);
+                    std::string vStr = FormatLuaValue(-1);
+                    p_settop(m_L, -2);
 
+                    if (vType == 4 && vStr.length() > 30) vStr = vStr.substr(0, 27) + "...";
+                    out.append(vStr);
                     out.append("\n");
                     p_settop(m_L, -2);
                 }
+                if (count == 0) out += "(Empty Table)\n";
             } else {
-                out += "Value is not a table.";
+                out += "Value is not a table. (Type: " + std::string(p_typename(m_L, targetType)) + ")";
             }
             p_settop(m_L, -2); // Pop item
             p_settop(m_L, -2); // Pop Registry
@@ -789,11 +1061,14 @@ void LuaInterface::InspectRegistryItem(HANDLE hPipe, const std::string& keyStr) 
         MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+
+        MessageHeader tok = { 0, RESP_OK };
+        WriteFile(hPipe, &tok, sizeof(tok), &w, NULL);
     });
 }
 
-void LuaInterface::ScanPlayers(HANDLE hPipe) {
-    SafeInvoke([&]() {
+bool LuaInterface::ScanPlayers(HANDLE hPipe) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -851,11 +1126,14 @@ void LuaInterface::ScanPlayers(HANDLE hPipe) {
         MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+
+        MessageHeader tok = { 0, RESP_OK };
+        WriteFile(hPipe, &tok, sizeof(tok), &w, NULL);
     });
 }
 
-void LuaInterface::DumpScripts(HANDLE hPipe) {
-    SafeInvoke([&]() {
+bool LuaInterface::DumpScripts(HANDLE hPipe) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -892,6 +1170,9 @@ void LuaInterface::DumpScripts(HANDLE hPipe) {
         MessageHeader h = { (uint32_t)out.size(), RESP_DATA };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, out.data(), out.size(), &w, NULL);
+
+        MessageHeader tok = { 0, RESP_OK };
+        WriteFile(hPipe, &tok, sizeof(tok), &w, NULL);
     });
 }
 
@@ -902,8 +1183,8 @@ int Writer(lua_State* L, const void* p, size_t sz, void* ud) {
     return 0;
 }
 
-void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
-    SafeInvoke([&]() {
+bool LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
+    return SafeInvoke([&]() {
         if (!m_L) {
             std::string msg = "Lua State not ready.";
             MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
@@ -918,11 +1199,10 @@ void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
                 p_getglobal(m_L, "_G");
                 p_getfield(m_L, -1, name.c_str());
                 if (p_type(m_L, -1) == 6) {
-                    if (p_iscfunction && p_iscfunction(m_L, -1)) {
-                        src = "-- Source for " + name + "\n-- [C Function] (No Bytecode Available)";
-                    } else if (!p_dump) {
-                        src = "-- Source retrieval unavailable: lua_dump not found.\n-- You can set an Override for this script.";
-                    } else {
+                    bool dumped = false;
+
+                    // Try dumping first
+                    if (p_dump) {
                         std::string bytecode;
                         int dumpRes = p_dump(m_L, Writer, &bytecode, 0);
                         if (dumpRes == 0) {
@@ -938,8 +1218,26 @@ void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
                             }
                             if (bytecode.size() > limit) hex += "\n... (Truncated)";
                             src = "-- Bytecode Dump (" + std::to_string(bytecode.size()) + " bytes):\n" + hex;
+                            dumped = true;
+                        }
+                    }
+
+                    if (!dumped) {
+                        // Attempt fallback via string.dump (Lua API)
+                        std::string luaDump = GetBytecodeViaLua(name);
+                        if (!luaDump.empty()) {
+                            src = luaDump;
+                            dumped = true;
+                        }
+                    }
+
+                    if (!dumped) {
+                        if (p_iscfunction && p_iscfunction(m_L, -1)) {
+                            src = "-- Source for " + name + "\n-- [C Function] (No Bytecode Available)";
+                        } else if (!p_dump) {
+                            src = "-- Source retrieval unavailable: lua_dump symbol not found, and string.dump failed.\n";
                         } else {
-                            src = "-- Source for " + name + "\n-- (lua_dump failed with error: " + std::to_string(dumpRes) + ")\n-- You can set an Override for this script.";
+                            src = "-- Source for " + name + "\n-- (lua_dump returned non-zero error)\n-- You can set an Override for this script.";
                         }
                     }
                 } else {
@@ -955,6 +1253,9 @@ void LuaInterface::GetScriptSource(HANDLE hPipe, const std::string& name) {
         MessageHeader h = { (uint32_t)src.size(), RESP_DATA };
         DWORD w; WriteFile(hPipe, &h, sizeof(h), &w, NULL);
         WriteFile(hPipe, src.data(), src.size(), &w, NULL);
+
+        MessageHeader tok = { 0, RESP_OK };
+        WriteFile(hPipe, &tok, sizeof(tok), &w, NULL);
     });
 }
 
@@ -976,6 +1277,7 @@ struct Task {
 
 std::mutex g_TaskMutex;
 std::queue<Task> g_TaskQueue;
+std::atomic<bool> g_HasTasks{false};
 
 std::mutex g_LogMutex;
 std::vector<std::string> g_LogQueue;
@@ -987,28 +1289,40 @@ void AppendLog(const std::string& msg) {
 }
 
 bool HasPendingTasks() {
-    std::lock_guard<std::mutex> lock(g_TaskMutex);
-    return !g_TaskQueue.empty();
+    return g_HasTasks.load(std::memory_order_relaxed);
 }
 
 bool LuaInterface::ProcessTasks() {
-    std::lock_guard<std::mutex> lock(g_TaskMutex);
-    bool didWork = !g_TaskQueue.empty();
+    bool didWork = false;
 
-    while (!g_TaskQueue.empty()) {
-        Task t = g_TaskQueue.front();
-        g_TaskQueue.pop();
+    auto SendError = [](HANDLE pipe, const std::string& msg) {
+        MessageHeader h = { (uint32_t)msg.size(), RESP_ERROR };
+        DWORD w; WriteFile(pipe, &h, sizeof(h), &w, NULL);
+        WriteFile(pipe, msg.data(), msg.size(), &w, NULL);
+    };
+
+    while (true) {
+        Task t;
+        {
+            std::lock_guard<std::mutex> lock(g_TaskMutex);
+            if (g_TaskQueue.empty()) {
+                g_HasTasks = false;
+                break;
+            }
+            t = g_TaskQueue.front();
+            g_TaskQueue.pop();
+            g_HasTasks = !g_TaskQueue.empty();
+            didWork = true;
+        }
 
         if (t.type == CMD_PING) {
             MessageHeader h = { 0, RESP_OK };
             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
         } else if (t.type == CMD_RUN_SCRIPT) {
-            SafeInvoke([&]() {
+            if (!SafeInvoke([&]() {
                 if (!m_L) {
                     std::string err = "Lua state not ready (hooks not installed).";
-                    MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
-                    DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-                    WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
+                    SendError(t.pipe, err);
                 } else {
                     std::string err;
                     try {
@@ -1016,30 +1330,27 @@ bool LuaInterface::ProcessTasks() {
                             MessageHeader h = { 0, RESP_OK };
                             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
                         } else {
-                            MessageHeader h = { (uint32_t)err.size(), RESP_ERROR };
-                            DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-                            WriteFile(t.pipe, err.data(), err.size(), &w, NULL);
+                            SendError(t.pipe, err);
                         }
                     } catch (...) {
-                        std::string except = "Exception caught during LoadScript";
-                        MessageHeader h = { (uint32_t)except.size(), RESP_ERROR };
-                        DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
-                        WriteFile(t.pipe, except.data(), except.size(), &w, NULL);
+                        SendError(t.pipe, "Exception caught during LoadScript");
                     }
                 }
-            });
+            })) {
+                 SendError(t.pipe, "Agent Internal Error (Exception during RunScript)");
+            }
         } else if (t.type == CMD_DUMP_GLOBALS) {
-            DumpGlobals(t.pipe);
+            if (!DumpGlobals(t.pipe)) SendError(t.pipe, "Agent Internal Error (Exception during DumpGlobals)");
         } else if (t.type == CMD_SCAN_PLAYERS) {
-            ScanPlayers(t.pipe);
+            if (!ScanPlayers(t.pipe)) SendError(t.pipe, "Agent Internal Error (Exception during ScanPlayers)");
         } else if (t.type == CMD_DUMP_REGISTRY) {
-            DumpRegistry(t.pipe);
+            if (!DumpRegistry(t.pipe)) SendError(t.pipe, "Agent Internal Error (Exception during DumpRegistry)");
         } else if (t.type == CMD_INSPECT_REGISTRY_ITEM) {
-            InspectRegistryItem(t.pipe, t.payload);
+            if (!InspectRegistryItem(t.pipe, t.payload)) SendError(t.pipe, "Agent Internal Error (Exception during InspectRegistryItem)");
         } else if (t.type == CMD_DUMP_SCRIPTS) {
-            DumpScripts(t.pipe);
+            if (!DumpScripts(t.pipe)) SendError(t.pipe, "Agent Internal Error (Exception during DumpScripts)");
         } else if (t.type == CMD_GET_SCRIPT_SOURCE) {
-            GetScriptSource(t.pipe, t.payload);
+            if (!GetScriptSource(t.pipe, t.payload)) SendError(t.pipe, "Agent Internal Error (Exception during GetScriptSource)");
         } else if (t.type == CMD_ADD_OVERRIDE) {
             size_t delim = t.payload.find('\n');
             if (delim != std::string::npos) {
@@ -1065,8 +1376,11 @@ bool LuaInterface::ProcessTasks() {
             MessageHeader h = { (uint32_t)combined.size(), RESP_DATA };
             DWORD w; WriteFile(t.pipe, &h, sizeof(h), &w, NULL);
             WriteFile(t.pipe, combined.data(), combined.size(), &w, NULL);
+
+            MessageHeader tok = { 0, RESP_OK };
+            WriteFile(t.pipe, &tok, sizeof(tok), &w, NULL);
         }
-        CloseHandle(t.pipe);
+        // Do not CloseHandle(t.pipe) here as it is managed by PipeServerThread
     }
     return didWork;
 }
@@ -1076,45 +1390,59 @@ void PipeServerThread() {
     sprintf_s(pipeName, "\\\\.\\pipe\\luatool_%lu", GetCurrentProcessId());
     std::cout << "[Agent] Pipe Server: " << pipeName << std::endl;
 
+    // Create a single pipe instance (or recreate if needed)
     while (true) {
         HANDLE hPipe = CreateNamedPipeA(pipeName, PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES, 512, 512, 0, NULL);
 
-        if (hPipe != INVALID_HANDLE_VALUE) {
-            std::cout << "[Agent] Pipe Created. Waiting for connection..." << std::endl;
-            if (ConnectNamedPipe(hPipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
-                std::cout << "[Agent] Client Connected." << std::endl;
-                MessageHeader h;
-                DWORD r;
-                if (ReadFile(hPipe, &h, sizeof(h), &r, NULL)) {
-                    std::string payload;
-                    if (h.length > 0) {
-                        std::vector<char> b(h.length);
-                        ReadFile(hPipe, b.data(), h.length, &r, NULL);
-                        payload.assign(b.begin(), b.end());
-                    }
-
-                    std::cout << "[Agent] Task Queued. Type: " << (int)h.type << std::endl;
-                    {
-                        std::lock_guard<std::mutex> lock(g_TaskMutex);
-                        g_TaskQueue.push({ h.type, payload, hPipe });
-                    }
-                    if (!LuaInterface::Get().IsLoaded()) {
-                         LuaInterface::Get().ProcessTasks();
-                    }
-                } else {
-                    std::cout << "[Agent] Failed to read request. Error: " << GetLastError() << std::endl;
-                    CloseHandle(hPipe);
-                }
-            } else {
-                std::cout << "[Agent] ConnectNamedPipe Failed. Error: " << GetLastError() << std::endl;
-                CloseHandle(hPipe);
-            }
-        } else {
+        if (hPipe == INVALID_HANDLE_VALUE) {
             std::cout << "[Agent] CreateNamedPipe Failed. Error: " << GetLastError() << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
         }
+
+        std::cout << "[Agent] Pipe Listening..." << std::endl;
+        if (ConnectNamedPipe(hPipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            std::cout << "[Agent] Client Connected." << std::endl;
+
+            // Loop for this session
+            while (true) {
+                MessageHeader h;
+                DWORD r;
+                if (!ReadFile(hPipe, &h, sizeof(h), &r, NULL) || r != sizeof(h)) {
+                    // Client disconnected
+                    std::cout << "[Agent] Client Disconnected." << std::endl;
+                    break;
+                }
+
+                std::string payload;
+                if (h.length > 0) {
+                    std::vector<char> b(h.length);
+                    if (!ReadFile(hPipe, b.data(), h.length, &r, NULL) || r != h.length) {
+                        std::cout << "[Agent] Error reading payload." << std::endl;
+                        break;
+                    }
+                    payload.assign(b.begin(), b.end());
+                }
+
+                // std::cout << "[Agent] Task Queued. Type: " << (int)h.type << std::endl; // Reduce spam
+                {
+                    std::lock_guard<std::mutex> lock(g_TaskMutex);
+                    g_TaskQueue.push({ h.type, payload, hPipe });
+                    g_HasTasks = true;
+                }
+
+                // If not loaded, process immediately (for initialization tasks)
+                if (!LuaInterface::Get().IsLoaded()) {
+                     LuaInterface::Get().ProcessTasks();
+                }
+            }
+            DisconnectNamedPipe(hPipe);
+        } else {
+            std::cout << "[Agent] ConnectNamedPipe Failed. Error: " << GetLastError() << std::endl;
+        }
+        CloseHandle(hPipe);
     }
 }
 

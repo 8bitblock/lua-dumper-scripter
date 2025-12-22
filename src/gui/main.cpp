@@ -5,230 +5,17 @@
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <queue>
-#include <mutex>
-#include <atomic>
-#include <thread>
 #include <fstream>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include "../common/lua_ipc.h"
-
-// Forward declare Injector
-bool InjectLibrary(DWORD pid, const std::string& library_path);
-
-struct ProcessInfo {
-    DWORD pid;
-    std::string name;
-};
-
-std::vector<ProcessInfo> GetProcesses() {
-    std::vector<ProcessInfo> list;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return list;
-
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-    if (Process32First(hSnap, &pe32)) {
-        do {
-            #ifdef UNICODE
-            char name[MAX_PATH];
-            size_t c;
-            wcstombs_s(&c, name, MAX_PATH, pe32.szExeFile, MAX_PATH);
-            list.push_back({ pe32.th32ProcessID, std::string(name) });
-            #else
-            list.push_back({ pe32.th32ProcessID, std::string(pe32.szExeFile) });
-            #endif
-        } while (Process32Next(hSnap, &pe32));
-    }
-    CloseHandle(hSnap);
-    return list;
-}
-
-// ----------------------------------------------------------------------------
-// Remote Agent Class (IPC Wrapper)
-// ----------------------------------------------------------------------------
-class RemoteAgent {
-public:
-    struct Command {
-        DWORD pid;
-        MessageType type;
-        std::string payload;
-    };
-
-    static RemoteAgent& Get() {
-        static RemoteAgent instance;
-        return instance;
-    }
-
-    void Start() {
-        if (m_Running) return;
-        m_Running = true;
-        m_Worker = std::thread(&RemoteAgent::WorkerLoop, this);
-        m_Worker.detach();
-    }
-
-    void Send(DWORD pid, MessageType type, const std::string& payload) {
-        std::lock_guard<std::mutex> lock(m_QueueMutex);
-        m_Queue.push({ pid, type, payload });
-    }
-
-    std::vector<std::string> ConsumeLogs() {
-        std::vector<std::string> logs;
-        {
-            std::lock_guard<std::mutex> lock(m_LogMutex);
-            logs.swap(m_PendingLogs);
-        }
-        return logs;
-    }
-
-    bool IsBusy() const { return m_IsBusy; }
-    std::string GetStatusText() {
-        std::lock_guard<std::mutex> lock(m_StatusMutex);
-        return m_StatusText;
-    }
-    std::string GetLastResult() {
-        std::lock_guard<std::mutex> lock(m_StatusMutex);
-        return m_LastResult;
-    }
-
-private:
-    RemoteAgent() = default;
-
-    void Log(const std::string& msg) {
-        std::lock_guard<std::mutex> lock(m_LogMutex);
-        m_PendingLogs.push_back(msg);
-    }
-
-    void WorkerLoop() {
-        while (m_Running) {
-            Command cmd;
-            bool hasCmd = false;
-            {
-                std::lock_guard<std::mutex> lock(m_QueueMutex);
-                if (!m_Queue.empty()) {
-                    cmd = m_Queue.front();
-                    m_Queue.pop();
-                    hasCmd = true;
-                }
-            }
-
-            if (hasCmd) {
-                ProcessCommand(cmd);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-        }
-    }
-
-    void ProcessCommand(const Command& cmd) {
-        m_IsBusy = true;
-        {
-            std::lock_guard<std::mutex> lock(m_StatusMutex);
-            if (cmd.type == CMD_RUN_SCRIPT) m_StatusText = "Running Script...";
-            else if (cmd.type == CMD_DUMP_GLOBALS) m_StatusText = "Dumping Globals...";
-            else m_StatusText = "Processing...";
-        }
-
-        char pipeName[256];
-        sprintf_s(pipeName, "\\\\.\\pipe\\luatool_%lu", cmd.pid);
-
-        if (!WaitNamedPipeA(pipeName, 2000)) {
-            Log("[Error] Pipe not ready. Error: " + std::to_string(GetLastError()));
-            m_IsBusy = false;
-            return;
-        }
-
-        HANDLE hPipe = CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            Log("[Error] Failed to connect. Error: " + std::to_string(GetLastError()));
-            m_IsBusy = false;
-            return;
-        }
-
-        DWORD mode = PIPE_READMODE_MESSAGE;
-        SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
-
-        // Send Request
-        MessageHeader header = { (uint32_t)cmd.payload.size(), cmd.type };
-        DWORD w;
-        if (!WriteFile(hPipe, &header, sizeof(header), &w, NULL)) {
-            Log("[Error] Write Header Failed. Error: " + std::to_string(GetLastError()));
-            CloseHandle(hPipe);
-            m_IsBusy = false;
-            return;
-        }
-        if (header.length > 0) {
-            if (!WriteFile(hPipe, cmd.payload.data(), header.length, &w, NULL)) {
-                Log("[Error] Write Payload Failed. Error: " + std::to_string(GetLastError()));
-                CloseHandle(hPipe);
-                m_IsBusy = false;
-                return;
-            }
-        }
-
-        // Stream Response
-        while (true) {
-            MessageHeader resp;
-            DWORD r;
-            if (!ReadFile(hPipe, &resp, sizeof(resp), &r, NULL) || r != sizeof(resp)) {
-                Log("[Error] Failed to read header (Pipe Closed or Error).");
-                break;
-            }
-
-            std::string body;
-            if (resp.length > 0) {
-                std::vector<char> buf(resp.length);
-                if (ReadFile(hPipe, buf.data(), resp.length, &r, NULL) && r == resp.length) {
-                    body.assign(buf.begin(), buf.end());
-                } else {
-                    Log("[Error] Failed to read body.");
-                    break;
-                }
-            }
-
-            if (resp.type == RESP_OK) {
-                Log("[OK] Finished.");
-                std::lock_guard<std::mutex> lock(m_StatusMutex);
-                m_LastResult = "Done.";
-                break;
-            } else if (resp.type == RESP_ERROR) {
-                Log("[Error] " + body);
-                std::lock_guard<std::mutex> lock(m_StatusMutex);
-                m_LastResult = "Error: " + body;
-                break;
-            } else if (resp.type == RESP_DATA) {
-                Log(body);
-            } else if (resp.type == RESP_PROGRESS) {
-                std::lock_guard<std::mutex> lock(m_StatusMutex);
-                m_StatusText = body;
-                // Also log progress to the console
-                Log("[Progress] " + body);
-            }
-        }
-        CloseHandle(hPipe);
-        m_IsBusy = false;
-    }
-
-    std::mutex m_QueueMutex;
-    std::queue<Command> m_Queue;
-
-    std::mutex m_LogMutex;
-    std::vector<std::string> m_PendingLogs;
-
-    std::thread m_Worker;
-    std::atomic<bool> m_Running = false;
-
-    std::atomic<bool> m_IsBusy{false};
-    std::mutex m_StatusMutex;
-    std::string m_StatusText;
-    std::string m_LastResult = "Ready";
-};
+#include "../injector/injector.h"
+#include "RemoteAgent.h"
+#include "ProcessManager.h"
 
 // ----------------------------------------------------------------------------
 // GUI Main
@@ -305,10 +92,30 @@ int main(int argc, char* argv[]) {
     std::string binDir = exePath.substr(0, exePath.find_last_of('\\'));
     std::string agentPath = binDir + "\\agent.dll";
 
-    std::vector<ProcessInfo> processes = GetProcesses();
+    std::vector<ProcessInfo> processes = ProcessManager::GetProcesses();
     bool done = false;
 
+    // Log polling timer
+    Uint32 lastLogPoll = 0;
+    Uint32 lastAutoRefresh = 0;
+    bool autoRefresh = true;
+
     while (!done) {
+        Uint32 now = SDL_GetTicks();
+
+        // Poll Logs
+        if (selected_pid > 0 && now - lastLogPoll > 100) {
+            RemoteAgent::Get().Send(selected_pid, CMD_PRINT_OUTPUT, "");
+            lastLogPoll = now;
+        }
+
+        // Auto Refresh (Players, Scripts) every 2s
+        if (selected_pid > 0 && autoRefresh && now - lastAutoRefresh > 2000) {
+            RemoteAgent::Get().Send(selected_pid, CMD_SCAN_PLAYERS, "");
+            RemoteAgent::Get().Send(selected_pid, CMD_DUMP_SCRIPTS, "");
+            lastAutoRefresh = now;
+        }
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -332,9 +139,11 @@ int main(int argc, char* argv[]) {
 
                 if (ImGui::BeginTabItem("Connection")) {
                     ImGui::Text("Processes");
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Auto-Refresh Data", &autoRefresh);
                     ImGui::Separator();
 
-                    if (ImGui::Button("Refresh", ImVec2(-1, 0))) processes = GetProcesses();
+                    if (ImGui::Button("Refresh", ImVec2(-1, 0))) processes = ProcessManager::GetProcesses();
                     ImGui::InputText("Filter", filter_buf, IM_ARRAYSIZE(filter_buf));
 
                     ImGui::BeginChild("Procs", ImVec2(0, -40), true);

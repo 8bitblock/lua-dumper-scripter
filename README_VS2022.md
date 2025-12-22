@@ -26,9 +26,9 @@ This project is a raw C++ codebase designed for Visual Studio 2022 on Windows.
 1.  Add a New Project -> "Console App" (C++) -> named `LuaTool`.
 2.  **Add Source Files**:
     *   Right-click Project -> Add -> Existing Item.
-    *   Navigate to `src/gui/` and select `main.cpp`.
-    *   Navigate to `src/common/` and select `ipc.h`.
-    *   Navigate to `src/injector/` and select `injector.cpp`.
+    *   Navigate to `src/gui/` and select `main.cpp`, `RemoteAgent.h`, `RemoteAgent.cpp`, `ProcessManager.h`, and `ProcessManager.cpp`.
+    *   Navigate to `src/common/` and select `lua_ipc.h`.
+    *   Navigate to `src/injector/` and select `injector.cpp` and `injector.h`.
 3.  **Add ImGui Source Files (CRITICAL)**:
     *   **WARNING**: Do NOT add these files twice. If you see errors like `already defined in ...`, remove all ImGui files from the project and re-add them exactly once.
     *   Navigate to `external/imgui/` and add these **5 files**:
@@ -54,7 +54,7 @@ This project is a raw C++ codebase designed for Visual Studio 2022 on Windows.
 
 ### 3. Project: Agent (The DLL)
 1.  Add a New Project -> "Dynamic-Link Library (DLL)" (C++) -> named `Agent`.
-2.  Add existing items from `src/agent/main.cpp` and `src/common/ipc.h`.
+2.  Add existing items from `src/agent/main.cpp` and `src/common/lua_ipc.h`.
 3.  **Properties**:
     *   **C/C++ -> General -> Additional Include Directories**: `$(SolutionDir)src/common`.
     *   **Linker -> System -> SubSystem**: Windows.
